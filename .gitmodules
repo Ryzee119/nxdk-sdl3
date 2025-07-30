@@ -1,0 +1,6 @@
+[submodule "SDL"]
+	path = SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "nxdk_glue/render/xgu"]
+	path = nxdk_glue/render/xgu
+	url = https://github.com/Ryzee119/xgu.git

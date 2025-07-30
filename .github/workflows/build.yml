@@ -1,0 +1,26 @@
+name: Xbox
+
+on: [push, pull_request]
+
+jobs:
+  Xbox:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Test compile program with CMake and Make
+      run: |
+        docker run --rm \
+          -v "$(pwd)":/workspace -w /workspace \
+          ghcr.io/xboxdev/nxdk:latest \
+          sh -c "apk add --no-cache git && \
+                git config --global --add safe.directory /workspace && \
+                cmake -B build -DCMAKE_TOOLCHAIN_FILE=/usr/src/nxdk/share/toolchain-nxdk.cmake -DSDL3WRAPPER_BUILD_EXAMPLES=ON
+                cmake --build build -j
+                make -C example -j"
