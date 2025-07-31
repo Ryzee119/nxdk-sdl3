@@ -19,7 +19,8 @@ This is a SDL3 implementation that works with [nxdk](https://github.com/XboxDev/
 ### CMake
 ```
 add_subdirectory(path/to/nxdk-sdl3)
-target_link_libraries(myapp PRIVATE SDL3)
+target_link_libraries(myapp PRIVATE SDL3::SDL3)
+target_link_libraries(myapp PUBLIC SDL3::Headers)
 ```
 or
 ```
@@ -32,7 +33,8 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(nxdk_sdl3)
-target_link_libraries(sdl3-test PRIVATE SDL3)
+target_link_libraries(myapp PRIVATE SDL3::SDL3)
+target_link_libraries(myapp PUBLIC SDL3::Headers)
 ```
 ### Makefile (nxdk style)
 ```
@@ -42,6 +44,5 @@ include path/to/nxdk-sdl3/config_sdl.make
 
 CFLAGS += $(SDL3_FLAGS)
 CXXFLAGS += $(SDL3_FLAGS)
-libSDL3.lib: $(SDL3_OBJS)
 main.exe: libSDL3.lib
 ```
