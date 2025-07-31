@@ -137,7 +137,7 @@ target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/libnxdk_automount_d.lib
 target_link_options(SDL3-static PRIVATE "-include:_automount_d_drive")
 
 # Only build examples if enabled (default OFF)
-option(SDL3WRAPPER_BUILD_EXAMPLE "Build example programs" ON)
+option(SDL3WRAPPER_BUILD_EXAMPLE "Build example programs" OFF)
 
 if(SDL3WRAPPER_BUILD_EXAMPLE)
     add_subdirectory(example)
