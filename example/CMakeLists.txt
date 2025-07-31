@@ -8,7 +8,8 @@ include(PrebuildNXDK)
 project(sdl3-test C)
 
 add_executable(sdl3-test main.c)
-target_link_libraries(sdl3-test PRIVATE SDL3)
+target_link_libraries(sdl3-test PRIVATE SDL3::SDL3)
+target_link_libraries(sdl3-test PUBLIC SDL3::Headers)
 
 # Post build steps to copy assets, generate XBE, and XISO
 include (Postbuild)

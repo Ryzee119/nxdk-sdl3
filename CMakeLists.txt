@@ -105,31 +105,39 @@ list(REMOVE_ITEM SDL3_PLATFORM_SRCS
     ${SDL3_DIR}/src/thread/windows/SDL_systhread.c
 )
 
-# === Create Library ===
-add_library(SDL3 STATIC ${SDL3_CORE_SRCS} ${SDL3_PLATFORM_SRCS})
-target_include_directories(SDL3 PUBLIC ${SDL3_DIR}/include)
-target_include_directories(SDL3 PRIVATE ${SDL3_DIR}/src ${SDL3_GLUE_DIR})
-target_compile_definitions(SDL3 PUBLIC ${SDL3_COMPILE_DEFS})
+# === Create SDL3 Library ===
+add_library(SDL3-static STATIC ${SDL3_CORE_SRCS} ${SDL3_PLATFORM_SRCS})
+add_library(SDL3::SDL3-static ALIAS SDL3-static)
+add_library(SDL3::SDL3 ALIAS SDL3-static)
+target_include_directories(SDL3-static PRIVATE ${SDL3_DIR}/include)
+target_include_directories(SDL3-static PRIVATE ${SDL3_DIR}/src ${SDL3_GLUE_DIR})
+target_compile_definitions(SDL3-static PRIVATE ${SDL3_COMPILE_DEFS})
+
+# === Create SDL3 Headers Interface ===
+add_library(SDL3_Headers INTERFACE)
+add_library(SDL3::Headers ALIAS SDL3_Headers)
+target_include_directories(SDL3_Headers INTERFACE ${SDL3_DIR}/include)
+target_compile_definitions(SDL3_Headers INTERFACE ${SDL3_COMPILE_DEFS})
+
+# === Link SDL3 Dependencies ===
+target_link_libraries(SDL3-static PUBLIC SDL3::Headers)
 
 # Link usb driver for input
 set(USB_INCLUDE_DIRS ${NXDK_DIR}/lib/usb/libusbohci/inc ${NXDK_DIR}/lib/usb/libusbohci_xbox)
 set(USB_DEFINES USBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\")
-target_include_directories(SDL3 PRIVATE ${USB_INCLUDE_DIRS})
-target_compile_definitions(SDL3 PRIVATE ${USB_DEFINES})
-target_link_libraries(SDL3 PUBLIC ${NXDK_DIR}/lib/nxdk_usb.lib)
+target_include_directories(SDL3-static PRIVATE ${USB_INCLUDE_DIRS})
+target_compile_definitions(SDL3-static PRIVATE ${USB_DEFINES})
+target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/nxdk_usb.lib)
 
 # Link pbkit for graphics
-target_link_libraries(SDL3 PUBLIC ${NXDK_DIR}/lib/libpbkit.lib)
+target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/libpbkit.lib)
 
 # Link automount support for BasePath D:\\
-target_link_libraries(SDL3 PUBLIC ${NXDK_DIR}/lib/libnxdk_automount_d.lib)
-target_link_options(SDL3 PRIVATE "-include:_automount_d_drive")
-
-# === Create Alias ===
-add_library(SDL3::SDL3 ALIAS SDL3)
+target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/libnxdk_automount_d.lib)
+target_link_options(SDL3-static PRIVATE "-include:_automount_d_drive")
 
 # Only build examples if enabled (default OFF)
-option(SDL3WRAPPER_BUILD_EXAMPLE "Build example programs" OFF)
+option(SDL3WRAPPER_BUILD_EXAMPLE "Build example programs" ON)
 
 if(SDL3WRAPPER_BUILD_EXAMPLE)
     add_subdirectory(example)
