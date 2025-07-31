@@ -79,3 +79,4 @@ SDL3_FLAGS += -DSDL_DISABLE_ALLOCA -DSDL_DISABLE_ANALYZE_MACROS -DSTBI_NO_SIMD -
 SDL3_FLAGS += -Wno-microsoft-include
 
 SDL3_OBJS = $(addsuffix .obj, $(basename $(SDL3_SRCS)))
+libSDL3.lib: $(SDL3_OBJS)

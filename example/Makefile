@@ -7,5 +7,4 @@ include $(CURDIR)/../config_sdl.make
 
 CFLAGS += $(SDL3_FLAGS)
 CXXFLAGS += $(SDL3_FLAGS)
-libSDL3.lib: $(SDL3_OBJS)
 main.exe: libSDL3.lib
