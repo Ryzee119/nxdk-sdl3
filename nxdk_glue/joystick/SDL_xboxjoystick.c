@@ -71,6 +71,10 @@ static void connection_callback(xid_dev_t *xid_dev, int status)
     (void)status;
     JOY_DBGMSG("connection_callback: uid %i connected \n", xid_dev->uid);
     SDL_PrivateJoystickAdded(xid_dev->uid);
+     SDL_SetGamepadMapping(xid_dev->uid, "default,Original Xbox Controller,a:b0,b:b1,back:b6,\
+        dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b10,leftshoulder:b4,leftstick:b8,\
+        lefttrigger:a2,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b9,righttrigger:a5,rightx:a3,\
+        righty:a4,start:b7,x:b2,y:b3");
 }
 
 static void disconnect_callback(xid_dev_t *xid_dev, int status)
