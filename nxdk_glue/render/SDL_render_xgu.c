@@ -18,13 +18,14 @@
 // hold three frames (pbkit is tripple buffered) worth of vertices. This is to allow for
 // both the back buffers being rendered, and the active front buffer being calculated.
 #ifndef SDL_XGU_VERTEX_BUFFER_SIZE
-#define SDL_XGU_VERTEX_BUFFER_SIZE (1024 * 1024)
+#define SDL_XGU_VERTEX_BUFFER_SIZE (512 * 1024)
 #endif
 
 #ifndef SDL_XGU_VERTEX_ALIGNMENT
 #define SDL_XGU_VERTEX_ALIGNMENT 32
 #endif
 
+#define SDL_XGU_SHOW_FPS 1
 #ifndef SDL_XGU_SHOW_FPS
 #define SDL_XGU_SHOW_FPS 0
 #endif
@@ -51,20 +52,20 @@ typedef struct xgu_texture
 
 typedef struct xgu_point
 {
-    float pos[2]; // xy
+    int16_t pos[2]; // xy
 } xgu_point_t;
 
 typedef struct xgu_vertex
 {
-    float pos[2];      // xy
-    uint32_t color[1]; // rgba8888
+    int16_t pos[2];   // xy
+    uint8_t color[4]; // rgba8888
 } xgu_vertex_t;
 
 typedef struct xgu_vertex_texture
 {
-    float pos[2];      // xy
-    uint32_t color[1]; // rgba8888
-    float tex[2];      // uv
+    int16_t pos[2];   // xy
+    uint8_t color[4]; // rgba8888
+    float tex[2];     // uv
 } xgu_vertex_textured_t;
 
 typedef struct xgu_render_data
@@ -75,6 +76,7 @@ typedef struct xgu_render_data
     SDL_Rect viewport;
     SDL_Rect clip_rect;
     SDL_BlendMode active_blend_mode;
+    void *vertex_data;
     int vertex_arena_offset;
     int vertex_allocations[NXDK_PBKIT_BUFFER_COUNT];
     int frame_index;
@@ -84,10 +86,9 @@ typedef struct xgu_render_data
 static inline void combiner_init(void);
 static inline void texture_combiner_apply(void);
 static inline void unlit_combiner_apply(void);
-static inline void clear_attribute_pointers(void);
 static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode);
 static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect);
-static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *offset);
+static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset);
 static bool arena_init(SDL_Renderer *renderer);
 static bool sdl_to_xgu_texture_format(SDL_PixelFormat sdl_format, int *xgu_texture_format, int *bytes_per_pixel, bool swizzled);
 static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel);
@@ -279,14 +280,17 @@ static bool XBOX_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
 {
     XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
 
-    uint8_t *vertices = (uint8_t *)arena_allocate(renderer, count * 2 * sizeof(float), &cmd->data.draw.first);
+    uint8_t *vertices = (uint8_t *)arena_allocate(renderer, count * sizeof(xgu_point_t), &cmd->data.draw.first);
     if (!vertices) {
         return SDL_OutOfMemory();
     }
 
-    // Each point is a vertex with 2 floats (x, y)
-    // This matches the xgu_vertex_t structure so we can copy it directly
-    SDL_memcpy(vertices, points, count * sizeof(xgu_point_t));
+    for (int i = 0; i < count; i++) {
+        xgu_point_t *point = (xgu_point_t *)vertices;
+        point->pos[0] = (int16_t)(points[i].x);
+        point->pos[1] = (int16_t)(points[i].y);
+        vertices += sizeof(xgu_point_t);
+    }
     cmd->data.draw.count = count;
 
     return true;
@@ -326,37 +330,37 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
         const float *vertex_pos = (float *)((char *)xy + j * xy_stride);
         const SDL_FColor *vertex_color = (SDL_FColor *)((intptr_t)color + j * color_stride);
 
-        // We could keep the color as four floats but we can save alot of vertex buffer space making it a single uint32_t
+        // We could keep the color as four floats but we can save alot of vertex buffer space making it uint_8_t
         const uint8_t r = (uint8_t)SDL_min((uint32_t)(vertex_color->r * color_scale * 255.0f), 255);
         const uint8_t g = (uint8_t)SDL_min((uint32_t)(vertex_color->g * color_scale * 255.0f), 255);
         const uint8_t b = (uint8_t)SDL_min((uint32_t)(vertex_color->b * color_scale * 255.0f), 255);
         const uint8_t a = (uint8_t)SDL_min((uint32_t)(vertex_color->a * 255.0f), 255);
-        const uint32_t color_value = r | (g << 8) | (b << 16) | (a << 24);
+
+        // Populate the common vertex data
+        xgu_vertex_t *xgu_vertex = (xgu_vertex_t *)vertices;
+        xgu_vertex->pos[0] = (int16_t)(vertex_pos[0] * scale_x);
+        xgu_vertex->pos[1] = (int16_t)(vertex_pos[1] * scale_y);
+        xgu_vertex->color[0] = r;
+        xgu_vertex->color[1] = g;
+        xgu_vertex->color[2] = b;
+        xgu_vertex->color[3] = a;
 
         if (texture) {
-            xgu_vertex_textured_t *xgu_vertex = (xgu_vertex_textured_t *)vertices;
-            xgu_vertex->pos[0] = vertex_pos[0] * scale_x;
-            xgu_vertex->pos[1] = vertex_pos[1] * scale_y;
-            xgu_vertex->color[0] = color_value;
-
+            // Populate the texture coordinates if a texture is provided
+            xgu_vertex_textured_t *xgu_texture_vertex = (xgu_vertex_textured_t *)vertices;
             const xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
             const float *vertex_uv = (float *)((char *)uv + j * uv_stride);
 
             // Swizzled texture coords must be normalised, otherwise we stick with unnormalised
             if (xgu_texture->swizzled) {
-                xgu_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width - 1) / (float)xgu_texture->data_width;
-                xgu_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height - 1) / (float)xgu_texture->data_height;
+                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width - 1) / (float)xgu_texture->data_width;
+                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height - 1) / (float)xgu_texture->data_height;
             } else {
-                xgu_vertex->tex[0] = vertex_uv[0] * xgu_texture->tex_width - 1;
-                xgu_vertex->tex[1] = vertex_uv[1] * xgu_texture->tex_height - 1;
+                xgu_texture_vertex->tex[0] = vertex_uv[0] * xgu_texture->tex_width - 1;
+                xgu_texture_vertex->tex[1] = vertex_uv[1] * xgu_texture->tex_height - 1;
             }
-
             vertices += sizeof(xgu_vertex_textured_t);
         } else {
-            xgu_vertex_t *xgu_vertex = (xgu_vertex_t *)vertices;
-            xgu_vertex->pos[0] = vertex_pos[0] * scale_x;
-            xgu_vertex->pos[1] = vertex_pos[1] * scale_y;
-            xgu_vertex->color[0] = color_value;
             vertices += sizeof(xgu_vertex_t);
         }
     }
@@ -495,11 +499,10 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
         pb_end(p);
 
         xgu_vertex_textured_t *xgu_verts = (xgu_vertex_textured_t *)vertices;
-        clear_attribute_pointers();
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
+        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
                                 SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_textured_t), xgu_verts->pos);
         xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
-                                sizeof(xgu_verts->color), sizeof(xgu_vertex_textured_t), xgu_verts->color);
+                                SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_textured_t), xgu_verts->color);
         xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT,
                                 SDL_arraysize(xgu_verts->tex), sizeof(xgu_vertex_textured_t), xgu_verts->tex);
         xgux_draw_arrays(XGU_TRIANGLES, 0, count);
@@ -515,11 +518,11 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
         pb_end(p);
 
         xgu_vertex_t *xgu_verts = (xgu_vertex_t *)vertices;
-        clear_attribute_pointers();
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
+        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
                                 SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_t), xgu_verts->pos);
         xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
-                                sizeof(xgu_verts->color), sizeof(xgu_vertex_t), xgu_verts->color);
+                                SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_t), xgu_verts->color);
+        xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
         xgux_draw_arrays(XGU_TRIANGLES, 0, count);
     }
 
@@ -534,10 +537,28 @@ static bool XBOX_RenderPoints(SDL_Renderer *renderer, void *vertices, SDL_Render
     set_blend_mode(renderer, cmd->data.draw.blend);
 
     xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
-    clear_attribute_pointers();
-    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
+    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
                             SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
+    xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
+    xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
     xgux_draw_arrays(XGU_POINTS, 0, count);
+
+    return true;
+}
+
+static bool XBOX_RenderLines(SDL_Renderer *renderer, void *vertices, SDL_RenderCommand *cmd)
+{
+    XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    const size_t count = cmd->data.draw.count;
+
+    set_blend_mode(renderer, cmd->data.draw.blend);
+
+    xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
+    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
+                            SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
+    xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
+    xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
+    xgux_draw_arrays(XGU_LINE_STRIP, 0, count);
 
     return true;
 }
@@ -578,13 +599,17 @@ static bool XBOX_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
             XBOX_RenderPoints(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
             break;
         }
+        case SDL_RENDERCMD_DRAW_LINES:
+        {
+            XBOX_RenderLines(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
+            break;
+        }
         case SDL_RENDERCMD_GEOMETRY:
         {
             XBOX_RenderGeometry(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
             break;
         }
         // SDL should use XBOX_QueueGeometry instead of these commands.
-        case SDL_RENDERCMD_DRAW_LINES:
         case SDL_RENDERCMD_FILL_RECTS:
         case SDL_RENDERCMD_COPY:
         case SDL_RENDERCMD_COPY_EX:
@@ -681,7 +706,7 @@ static void XBOX_DestroyRenderer(SDL_Renderer *renderer)
     pb_kill();
 
     SDL_free(render_data);
-    MmFreeContiguousMemory(renderer->vertex_data);
+    MmFreeContiguousMemory(render_data->vertex_data);
 
     renderer->internal = NULL;
     renderer->vertex_data = NULL;
@@ -762,6 +787,10 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
         pb_end(p);
     }
 
+    for (int i = 0; i < XGU_ATTRIBUTE_COUNT; i++) {
+        xgux_set_attrib_pointer(i, XGU_FLOAT, 0, 0, NULL);
+    }
+
     p = pb_begin();
     p = xgu_set_transform_execution_mode(p, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
     p = xgu_set_projection_matrix(p, m_identity);
@@ -813,8 +842,8 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB4444);
     SDL_SetNumberProperty(SDL_GetRendererProperties(renderer), SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 1024 * 1024);
 
-    // This hint makes SDL use the geometry API to draw lines. This is more correct and allows for line thickness
-    SDL_SetHint(SDL_HINT_RENDER_LINE_METHOD, "3");
+    // This hint makes SDL use the driver line API.
+    SDL_SetHint(SDL_HINT_RENDER_LINE_METHOD, "2");
 
     while (pb_busy()) {
         Sleep(0);
@@ -896,21 +925,23 @@ static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, int *xgu_format, int 
     }
 }
 
-// Although SDL provides SDL_AllocateRenderVertices, this allocates on the heap,
-// which we don't want. Instead we provide our own that uses contiguous memory allocation
 static bool arena_init(SDL_Renderer *renderer)
 {
-    renderer->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
-                                                         PAGE_WRITECOMBINE | PAGE_READWRITE);
-    if (renderer->vertex_data == NULL) {
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    render_data->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
+                                                            PAGE_WRITECOMBINE | PAGE_READWRITE);
+    if (render_data->vertex_data == NULL) {
         SDL_SetError("Failed to allocate XGU arena");
         return false;
     }
 
+    renderer->vertex_data = render_data->vertex_data;
+    render_data->vertex_arena_offset = 0;
+
     return true;
 }
 
-static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *offset)
+static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     int total_allocated = 0;
@@ -935,19 +966,13 @@ static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *offset)
         return NULL;
     }
 
-    void *ptr = (void *)((intptr_t)renderer->vertex_data + render_data->vertex_arena_offset);
+    void *ptr = (void *)((intptr_t)render_data->vertex_data + render_data->vertex_arena_offset);
+    assert(((intptr_t)ptr & (SDL_XGU_VERTEX_ALIGNMENT - 1)) == 0);
 
-    *offset = render_data->vertex_arena_offset;
+    *vertex_data_offset = render_data->vertex_arena_offset;
     render_data->vertex_arena_offset += size;
     render_data->vertex_allocations[render_data->frame_index] += size;
     return ptr;
-}
-
-static inline void clear_attribute_pointers(void)
-{
-    for (int i = 0; i < XGU_ATTRIBUTE_COUNT; i++) {
-        xgux_set_attrib_pointer(i, XGU_FLOAT, 0, 0, NULL);
-    }
 }
 
 static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
