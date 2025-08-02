@@ -59,29 +59,52 @@ typedef struct joystick_hwdata
     xid_dev_t *xid_dev;
     Uint8 raw_data[MAX_PACKET_SIZE];
     Uint16 current_rumble[2];
+    bool new_data;
 } joystick_hwdata, *pjoystick_hwdata;
 
 static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, Uint8 *rdata);
 
 static Sint32 SDL_XBOX_JoystickGetDevicePlayerIndex(Sint32 device_index);
 
-// Create SDL events for connection/disconnection. These events can then be handled in the user application
+// We need a interrupt safe queue to push controller connection events for processing
+// in SDL main thread
+typedef struct controller_connection_event
+{
+    uint32_t uid;
+    bool connected;
+} controller_connection_event_t;
+static controller_connection_event_t uid_event_queue[8];
+static SDL_AtomicInt uid_event_queue_index;
+static uint32_t uid_event_processed_index = 0;
+
 static void connection_callback(xid_dev_t *xid_dev, int status)
 {
     (void)status;
-    JOY_DBGMSG("connection_callback: uid %i connected \n", xid_dev->uid);
-    SDL_PrivateJoystickAdded(xid_dev->uid);
-     SDL_SetGamepadMapping(xid_dev->uid, "default,Original Xbox Controller,a:b0,b:b1,back:b6,\
-        dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b10,leftshoulder:b4,leftstick:b8,\
-        lefttrigger:a2,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b9,righttrigger:a5,rightx:a3,\
-        righty:a4,start:b7,x:b2,y:b3");
+    int old_value = SDL_GetAtomicInt(&uid_event_queue_index);
+    int new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+
+    uid_event_queue[old_value].uid = xid_dev->uid;
+    uid_event_queue[old_value].connected = true;
+
+    while (!SDL_CompareAndSwapAtomicInt(&uid_event_queue_index, old_value, new_value)) {
+        old_value = SDL_GetAtomicInt(&uid_event_queue_index);
+        new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+    }
 }
 
 static void disconnect_callback(xid_dev_t *xid_dev, int status)
 {
     (void)status;
-    JOY_DBGMSG("disconnect_callback uid %i disconnected\n", xid_dev->uid);
-    SDL_PrivateJoystickRemoved(xid_dev->uid);
+    int old_value = SDL_GetAtomicInt(&uid_event_queue_index);
+    int new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+
+    uid_event_queue[old_value].uid = xid_dev->uid;
+    uid_event_queue[old_value].connected = false;
+
+    while (!SDL_CompareAndSwapAtomicInt(&uid_event_queue_index, old_value, new_value)) {
+        old_value = SDL_GetAtomicInt(&uid_event_queue_index);
+        new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+    }
 }
 
 static void int_read_callback(UTR_T *utr)
@@ -101,11 +124,7 @@ static void int_read_callback(UTR_T *utr)
 
     if (joy->hwdata != NULL) {
         SDL_memcpy(joy->hwdata->raw_data, utr->buff, data_len);
-
-        // Re-queue the USB transfer
-        utr->xfer_len = 0;
-        utr->bIsTransferDone = 0;
-        usbh_int_xfer(utr);
+        joy->hwdata->new_data = true;
     }
 }
 
@@ -199,6 +218,24 @@ static int SDL_XBOX_JoystickGetCount(void)
 static void SDL_XBOX_JoystickDetect(void)
 {
     usbh_pooling_hubs();
+
+    // Process any queued connection events
+    int queued_pos = SDL_GetAtomicInt(&uid_event_queue_index);
+    while (uid_event_processed_index != queued_pos) {
+        controller_connection_event_t *event = &uid_event_queue[uid_event_processed_index];
+        if (event->connected) {
+            JOY_DBGMSG("connection_callback: uid %i connected \n", event->uid);
+            SDL_PrivateJoystickAdded(event->uid);
+            SDL_SetGamepadMapping(event->uid,
+                                  "default,Original Xbox Controller,*,"
+                                  "a:b0,b:b1,back:b4,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,leftshoulder:b9,leftstick:b7,lefttrigger:a4,"
+                                  "leftx:a0,lefty:a1,rightshoulder:b10,rightstick:b8,righttrigger:a5,rightx:a2,righty:a3,start:b6,x:b2,y:b3,");
+        } else {
+            JOY_DBGMSG("disconnect_callback uid %i disconnected\n", event->uid);
+            SDL_PrivateJoystickRemoved(event->uid);
+        }
+        uid_event_processed_index = (uid_event_processed_index + 1) % SDL_arraysize(uid_event_queue);
+    }
 }
 
 static bool SDL_XBOX_JoystickIsDevicePresent(Uint16 vendor_id, Uint16 product_id, Uint16 version, const char *name)
@@ -332,7 +369,7 @@ static bool SDL_XBOX_JoystickOpen(SDL_Joystick *joystick, int device_index)
         joystick->naxes = 6;     /* LStickY, LStickX, LTrigg, RStickY, RStickX, RTrigg */
         joystick->nballs = 0;    /* No balls here */
         joystick->nhats = 1;     /* D-pad */
-        joystick->nbuttons = 10; /* A, B, X, Y, RB, LB, Back, Start, LThumb, RThumb */
+        joystick->nbuttons = 11; /* A, B, X, Y, RB, LB, Back, Start, LThumb, RThumb + Guide (Unused)*/
         break;
     case XID_TYPE_XREMOTE:
         joystick->naxes = 0;
@@ -426,12 +463,20 @@ static void SDL_XBOX_JoystickUpdate(SDL_Joystick *joystick)
         return;
     }
 
+    if (joystick->hwdata->new_data == false) {
+        // No new data, return early
+        return;
+    }
+
     Uint64 timestamp = SDL_GetTicksNS();
     Uint8 button_data[MAX_PACKET_SIZE];
 
     KIRQL prev_irql = KeRaiseIrqlToDpcLevel();
     SDL_memcpy(button_data, joystick->hwdata->raw_data, MAX_PACKET_SIZE);
     KfLowerIrql(prev_irql);
+
+    // Get latest data from the joystick
+    usbh_xid_read(joystick->hwdata->xid_dev, 0, (void *)int_read_callback);
 
     // FIXME. Steel Battalion and XREMOTE should be parsed differently.
     if (parse_input_data(joystick->hwdata->xid_dev, &xpad, button_data)) {
@@ -471,28 +516,28 @@ static void SDL_XBOX_JoystickUpdate(SDL_Joystick *joystick)
 
         // TRIGGERS
         // LEFT TRIGGER (0-255 must be converted to signed short)
-        if (xpad.bLeftTrigger != joystick->axes[2].value)
+        if (xpad.bLeftTrigger != joystick->axes[SDL_GAMEPAD_AXIS_LEFT_TRIGGER].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, ((xpad.bLeftTrigger << 8) | xpad.bLeftTrigger) - (1 << 15));
         // RIGHT TRIGGER (0-255 must be converted to signed short)
-        if (xpad.bRightTrigger != joystick->axes[5].value)
+        if (xpad.bRightTrigger != joystick->axes[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, ((xpad.bRightTrigger << 8) | xpad.bRightTrigger) - (1 << 15));
 
         // ANALOG STICKS
         // LEFT X-AXIS
         axis = xpad.sThumbLX;
-        if (axis != joystick->axes[0].value)
+        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_LEFTX].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTX, axis);
         // LEFT Y-AXIS
         axis = xpad.sThumbLY;
-        if (axis != joystick->axes[1].value)
+        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_LEFTY].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTY, ~axis);
         // RIGHT X-AXIS
         axis = xpad.sThumbRX;
-        if (axis != joystick->axes[3].value)
+        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_RIGHTX].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTX, axis);
         // RIGHT Y-AXIS
         axis = xpad.sThumbRY;
-        if (axis != joystick->axes[4].value)
+        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_RIGHTY].value)
             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTY, ~axis);
     }
     return;
