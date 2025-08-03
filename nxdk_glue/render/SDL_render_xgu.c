@@ -25,7 +25,6 @@
 #define SDL_XGU_VERTEX_ALIGNMENT 32
 #endif
 
-#define SDL_XGU_SHOW_FPS 1
 #ifndef SDL_XGU_SHOW_FPS
 #define SDL_XGU_SHOW_FPS 0
 #endif
