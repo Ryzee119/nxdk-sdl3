@@ -458,7 +458,13 @@ static bool XBOX_RenderClear(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
                              ((uint32_t)(color.b * 255.0f) << 0) |
                              ((uint32_t)(color.a * 255.0f) << 24);
 
-    pb_fill(0, 0, pb_back_buffer_width(), pb_back_buffer_height(), color32);
+    if (render_data->active_render_target) {
+        pb_fill(0, 0, render_data->active_render_target->tex_width,
+                render_data->active_render_target->tex_height, color32);
+    } else {
+        pb_fill(0, 0, pb_back_buffer_width(), pb_back_buffer_height(), color32);
+    }
+
     return true;
 }
 
