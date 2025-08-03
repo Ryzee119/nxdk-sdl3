@@ -746,7 +746,14 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
         pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
     }
 
-    pb_init();
+    while (pb_init() < 0) {
+        DbgPrint("[nxdk renderer] pbkit initialization failed, retrying...\n");
+        Sleep(10);
+    }
+
+    // pbkit can disable video output in some cases, re-enable it
+    XVideoSetVideoEnable(true);
+
     pb_show_front_screen();
     pb_target_back_buffer();
 
