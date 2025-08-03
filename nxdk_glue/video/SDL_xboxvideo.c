@@ -24,23 +24,22 @@ static bool XBOX_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
     SDL_PixelFormat format = SDL_GetWindowPixelFormat(window);
     int bpp = SDL_BYTESPERPIXEL(format) * 8;
 
-    // Scale up the window to the next usuable size
-    if (window->w < 640) {
+    // Unless it looks like we are request HD modes, fall back to 640x480
+    if (window->w * window->h < 1280 * 720) {
         window->w = 640;
-    }
-    if (window->h < 480) {
         window->h = 480;
-    }
-    if (window->w > 1280) {
+    } else {
+        // Anything else attempt 720p
         window->w = 1280;
-    }
-    if (window->h > 720) {
         window->h = 720;
     }
 
     if (!XVideoSetMode(window->w, window->h, bpp, REFRESH_DEFAULT)) {
-
-        return SDL_SetError("Failed to set video mode to %dx%dx%d", window->w, window->h, bpp);
+        window->w = 640;
+        window->h = 480;
+        if (!XVideoSetMode(window->w, window->h, bpp, REFRESH_DEFAULT)) {
+            return SDL_SetError("Failed to set video mode to %dx%dx%d", window->w, window->h, bpp);
+        }
     }
 
     VIDEO_MODE vm = XVideoGetMode();
@@ -51,6 +50,9 @@ static bool XBOX_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
 
     window->flags &= ~(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     window->flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_ALWAYS_ON_TOP;
+
+    // This prevents SDL altering these window properties
+    window->flags |= SDL_WINDOW_EXTERNAL;
 
     /* One window, it always has focus */
     SDL_SetMouseFocus(window);
