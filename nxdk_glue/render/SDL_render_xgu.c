@@ -164,6 +164,7 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         return SDL_OutOfMemory();
     }
     xgu_texture->data_physical_address = (uint8_t *)MmGetPhysicalAddress(xgu_texture->data);
+    SDL_memset(xgu_texture->data, 0, allocation_size);
 
     texture->internal = xgu_texture;
     return true;
