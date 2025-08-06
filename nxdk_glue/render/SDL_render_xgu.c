@@ -210,20 +210,40 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
     const Uint8 *src = pixels;
 
-    void *dst;
-    int dpitch;
-    XBOX_LockTexture(renderer, texture, rect, &dst, &dpitch);
-
     if (xgu_texture->swizzled) {
-        const int length = rect->w * SDL_BYTESPERPIXEL(texture->format);
-        swizzle_rect(src, rect->w, rect->h, dst, length, SDL_BYTESPERPIXEL(texture->format));
+        // If we are updating the entire texture, we can swizzle it entirely
+        if (rect->x == 0 && rect->y == 0 &&
+            rect->w == xgu_texture->tex_width && rect->h == xgu_texture->tex_height) {
+            swizzle_rect(src, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, pitch, SDL_BYTESPERPIXEL(texture->format));
+        }
+        // Otherwise we need to unswizzle, update the texture then swizzle again
+        else {
+            // Unswizzle the whole texture to a temporary buffer
+            uint8_t *unswizzled = (uint8_t *)SDL_malloc(xgu_texture->pitch * xgu_texture->tex_height);
+            if (unswizzled == NULL) {
+                return SDL_OutOfMemory();
+            }
+            unswizzle_rect(xgu_texture->data, xgu_texture->tex_width, xgu_texture->tex_height,
+                           unswizzled, xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
+
+            // Copy the new pixels into the unswizzled buffer
+            uint8_t *dst = &((uint8_t *)unswizzled)[rect->y * xgu_texture->pitch +
+                                                    rect->x * xgu_texture->bytes_per_pixel];
+            SDL_ConvertPixels(rect->w, rect->h,
+                              texture->format, src, pitch,
+                              texture->format, dst, xgu_texture->pitch);
+
+            // Now swizzle the unswizzled buffer back to the texture
+            swizzle_rect(unswizzled, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
+            SDL_free(unswizzled);
+        }
     } else {
+        uint8_t *dst = &((uint8_t *)xgu_texture->data)[rect->y * xgu_texture->pitch +
+                                                       rect->x * xgu_texture->bytes_per_pixel];
         SDL_ConvertPixels(rect->w, rect->h,
                           texture->format, src, pitch,
-                          texture->format, dst, dpitch);
+                          texture->format, dst, xgu_texture->pitch);
     }
-
-    XBOX_UnlockTexture(renderer, texture);
 
     return true;
 }
