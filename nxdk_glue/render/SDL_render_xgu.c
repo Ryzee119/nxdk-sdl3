@@ -509,10 +509,10 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
     if (cmd->data.draw.texture) {
         xgu_texture_t *xgu_texture = (xgu_texture_t *)cmd->data.draw.texture->internal;
 
-        p = pb_begin();
-
         if (render_data->texture_shader_active == 0) {
+            p = pb_begin();
             texture_combiner_apply();
+            pb_end(p);
             render_data->texture_shader_active = 1;
         }
 
@@ -522,6 +522,7 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
 
         if (render_data->active_texture != xgu_texture) {
             const int texture_index = 0;
+            p = pb_begin();
             p = xgu_set_texture_offset(p, texture_index, xgu_texture->data_physical_address);
             p = xgu_set_texture_format(p, texture_index, 2, false, XGU_SOURCE_COLOR, 2, xgu_texture->format, 1,
                                        __builtin_ctz(xgu_texture->data_width), __builtin_ctz(xgu_texture->data_height), 0);
@@ -530,10 +531,9 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
             p = xgu_set_texture_control1(p, texture_index, xgu_texture->pitch);
             p = xgu_set_texture_image_rect(p, texture_index, xgu_texture->tex_width, xgu_texture->tex_height);
             p = xgu_set_texture_filter(p, texture_index, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN, texture_filter, texture_filter, false, false, false, false);
+            pb_end(p);
             render_data->active_texture = xgu_texture;
         }
-
-        pb_end(p);
 
         xgu_vertex_textured_t *xgu_verts = (xgu_vertex_textured_t *)vertices;
         xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
@@ -543,16 +543,14 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
         xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT,
                                 SDL_arraysize(xgu_verts->tex), sizeof(xgu_vertex_textured_t), xgu_verts->tex);
         xgux_draw_arrays(XGU_TRIANGLES, 0, count);
-
     } else {
-        p = pb_begin();
 
         if (render_data->texture_shader_active == 1) {
+            p = pb_begin();
             unlit_combiner_apply();
+            pb_end(p);
             render_data->texture_shader_active = 0;
         }
-
-        pb_end(p);
 
         xgu_vertex_t *xgu_verts = (xgu_vertex_t *)vertices;
         xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
