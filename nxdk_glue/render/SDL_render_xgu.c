@@ -352,11 +352,11 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
 
             // Swizzled texture coords must be normalised, otherwise we stick with unnormalised
             if (xgu_texture->swizzled) {
-                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width - 1) / (float)xgu_texture->data_width;
-                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height - 1) / (float)xgu_texture->data_height;
+                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width) / (float)(xgu_texture->data_width);
+                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height) / (float)(xgu_texture->data_height);
             } else {
-                xgu_texture_vertex->tex[0] = vertex_uv[0] * xgu_texture->tex_width - 1;
-                xgu_texture_vertex->tex[1] = vertex_uv[1] * xgu_texture->tex_height - 1;
+                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width);
+                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height);
             }
             vertices += sizeof(xgu_vertex_textured_t);
         } else {
