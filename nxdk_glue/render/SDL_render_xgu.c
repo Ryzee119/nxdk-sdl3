@@ -111,8 +111,10 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         return SDL_OutOfMemory();
     }
 
+    const bool is_render_target = SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, 0) == SDL_TEXTUREACCESS_TARGET;
+
     // If this is a render target, we need to check if the render target format is supported
-    if (SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, 0) == SDL_TEXTUREACCESS_TARGET) {
+    if (is_render_target) {
         int surface_format;
         int bytes_per_pixel;
         if (sdl_to_xgu_surface_format(texture->format, &surface_format, &bytes_per_pixel) == false) {
@@ -135,13 +137,23 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     xgu_texture->tex_width = texture->w;
     xgu_texture->tex_height = texture->h;
 
+    // Swizzled textures next to be in a power of 2 size container
     if (xgu_texture->swizzled) {
         xgu_texture->data_width = npot2pot(texture->w);
         xgu_texture->data_height = npot2pot(texture->h);
+    }
+    // Render targets need to have a power of 2 and pitch >= 64.
+    else if (is_render_target) {
+        xgu_texture->data_width = npot2pot(texture->w);
+        xgu_texture->data_width = SDL_max(xgu_texture->data_width, 64 / xgu_texture->bytes_per_pixel);
     } else {
         xgu_texture->data_width = texture->w;
         xgu_texture->data_height = texture->h;
     }
+
+    // Texture must be atleast 8 bytes
+    xgu_texture->data_width = SDL_max(xgu_texture->data_width, 8 / xgu_texture->bytes_per_pixel);
+    xgu_texture->data_height = SDL_max(xgu_texture->data_height, 8 / xgu_texture->bytes_per_pixel);
 
     xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
 
