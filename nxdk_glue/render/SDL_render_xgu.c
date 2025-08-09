@@ -44,7 +44,12 @@ typedef struct xgu_texture
     int bytes_per_pixel;
     int pitch;
     int swizzled;
+    float u_scale;
+    float v_scale;
     XguTexFormatColor format;
+    XguTexFilter filter;
+    XguTextureAddress mode_u;
+    XguTextureAddress mode_v;
     uint8_t *data;
     uint8_t *data_physical_address;
 } xgu_texture_t;
@@ -92,7 +97,14 @@ static bool arena_init(SDL_Renderer *renderer);
 static bool sdl_to_xgu_texture_format(SDL_PixelFormat sdl_format, int *xgu_texture_format, int *bytes_per_pixel, bool swizzled);
 static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel);
 static inline uint32_t npot2pot(uint32_t num);
-static void calculate_fps(int stage);
+
+enum fps_stage
+{
+    FPS_STAGE_RESET,
+    FPS_STAGE_CALCULATE,
+    FPS_STAGE_DISPLAY,
+};
+static void calculate_fps(enum fps_stage stage);
 
 // pushbuffer pointer
 static uint32_t *p = NULL;
@@ -141,14 +153,24 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     if (xgu_texture->swizzled) {
         xgu_texture->data_width = npot2pot(texture->w);
         xgu_texture->data_height = npot2pot(texture->h);
+
+        // Texture coordinates need to be normalised for swizzled textures
+        xgu_texture->u_scale = (float)xgu_texture->tex_width / (float)xgu_texture->data_width;
+        xgu_texture->v_scale = (float)xgu_texture->tex_height / (float)xgu_texture->data_height;
     }
-    // Render targets need to have a power of 2 and pitch >= 64.
+    // Render targets need to have a pitch that is a multiple of 64 bytes,
     else if (is_render_target) {
-        xgu_texture->data_width = npot2pot(texture->w);
-        xgu_texture->data_width = SDL_max(xgu_texture->data_width, 64 / xgu_texture->bytes_per_pixel);
+        const int pixel_multiple = (64 / xgu_texture->bytes_per_pixel);
+        xgu_texture->data_width += pixel_multiple - (xgu_texture->tex_width % pixel_multiple);
+
+        xgu_texture->u_scale = (float)xgu_texture->tex_width;
+        xgu_texture->v_scale = (float)xgu_texture->tex_height;
     } else {
         xgu_texture->data_width = texture->w;
         xgu_texture->data_height = texture->h;
+
+        xgu_texture->u_scale = (float)xgu_texture->tex_width;
+        xgu_texture->v_scale = (float)xgu_texture->tex_height;
     }
 
     // Texture must be atleast 8 bytes
@@ -158,7 +180,7 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
 
     const SIZE_T allocation_size = xgu_texture->data_height * xgu_texture->pitch;
-    xgu_texture->data = MmAllocateContiguousMemoryEx(allocation_size, 0, 0xFFFFFFFF, 0, PAGE_WRITECOMBINE | PAGE_READWRITE);
+    xgu_texture->data = MmAllocateContiguousMemoryEx(allocation_size, 0, SDL_MAX_UINT32, 0, PAGE_WRITECOMBINE | PAGE_READWRITE);
     if (xgu_texture->data == NULL) {
         SDL_free(xgu_texture);
         return SDL_OutOfMemory();
@@ -235,7 +257,8 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
                               texture->format, dst, xgu_texture->pitch);
 
             // Now swizzle the unswizzled buffer back to the texture
-            swizzle_rect(unswizzled, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
+            swizzle_rect(unswizzled, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data,
+                         xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
             SDL_free(unswizzled);
         }
     } else {
@@ -359,38 +382,29 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
             j = i;
         }
 
-        const float *vertex_pos = (float *)((char *)xy + j * xy_stride);
-        const SDL_FColor *vertex_color = (SDL_FColor *)((intptr_t)color + j * color_stride);
-
         // We could keep the color as four floats but we can save alot of vertex buffer space making it uint_8_t
-        const uint8_t r = (uint8_t)SDL_min((uint32_t)(vertex_color->r * color_scale * 255.0f), 255);
-        const uint8_t g = (uint8_t)SDL_min((uint32_t)(vertex_color->g * color_scale * 255.0f), 255);
-        const uint8_t b = (uint8_t)SDL_min((uint32_t)(vertex_color->b * color_scale * 255.0f), 255);
-        const uint8_t a = (uint8_t)SDL_min((uint32_t)(vertex_color->a * 255.0f), 255);
+        const SDL_FColor *vertex_color = (SDL_FColor *)((intptr_t)color + j * color_stride);
+        const uint32_t r = (uint32_t)(vertex_color->r * color_scale * 255.0f);
+        const uint32_t g = (uint32_t)(vertex_color->g * color_scale * 255.0f);
+        const uint32_t b = (uint32_t)(vertex_color->b * color_scale * 255.0f);
+        const uint32_t a = (uint32_t)(vertex_color->a * 255.0f);
 
         // Populate the common vertex data
+        const float *vertex_pos = (float *)((char *)xy + j * xy_stride);
         xgu_vertex_t *xgu_vertex = (xgu_vertex_t *)vertices;
         xgu_vertex->pos[0] = (int16_t)(vertex_pos[0] * scale_x);
         xgu_vertex->pos[1] = (int16_t)(vertex_pos[1] * scale_y);
-        xgu_vertex->color[0] = r;
-        xgu_vertex->color[1] = g;
-        xgu_vertex->color[2] = b;
-        xgu_vertex->color[3] = a;
+        xgu_vertex->color[0] = (uint8_t)SDL_min(r, UINT8_MAX);
+        xgu_vertex->color[1] = (uint8_t)SDL_min(g, UINT8_MAX);
+        xgu_vertex->color[2] = (uint8_t)SDL_min(b, UINT8_MAX);
+        xgu_vertex->color[3] = (uint8_t)SDL_min(a, UINT8_MAX);
 
         if (texture) {
-            // Populate the texture coordinates if a texture is provided
             xgu_vertex_textured_t *xgu_texture_vertex = (xgu_vertex_textured_t *)vertices;
             const xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
             const float *vertex_uv = (float *)((char *)uv + j * uv_stride);
-
-            // Swizzled texture coords must be normalised, otherwise we stick with unnormalised
-            if (xgu_texture->swizzled) {
-                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width) / (float)(xgu_texture->data_width);
-                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height) / (float)(xgu_texture->data_height);
-            } else {
-                xgu_texture_vertex->tex[0] = vertex_uv[0] * (float)(xgu_texture->tex_width);
-                xgu_texture_vertex->tex[1] = vertex_uv[1] * (float)(xgu_texture->tex_height);
-            }
+            xgu_texture_vertex->tex[0] = vertex_uv[0] * xgu_texture->u_scale;
+            xgu_texture_vertex->tex[1] = vertex_uv[1] * xgu_texture->v_scale;
             vertices += sizeof(xgu_vertex_textured_t);
         } else {
             vertices += sizeof(xgu_vertex_t);
@@ -517,23 +531,53 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
             render_data->texture_shader_active = 1;
         }
 
-        // Neatest filtering is used for nearest and pixelart scale modes
+        // Nearest filtering is used for nearest and pixelart scale modes
         const XguTexFilter texture_filter =
             (cmd->data.draw.texture_scale_mode == SDL_SCALEMODE_LINEAR) ? XGU_TEXTURE_FILTER_LINEAR : XGU_TEXTURE_FILTER_NEAREST;
 
+        const XguTextureAddress texture_address_mode_u =
+            (cmd->data.draw.texture_address_mode_u == SDL_TEXTURE_ADDRESS_CLAMP) ? XGU_CLAMP_TO_EDGE : XGU_WRAP;
+
+        const XguTextureAddress texture_address_mode_v =
+            (cmd->data.draw.texture_address_mode_v == SDL_TEXTURE_ADDRESS_CLAMP) ? XGU_CLAMP_TO_EDGE : XGU_WRAP;
+
+        const int texture_index = 0;
         if (render_data->active_texture != xgu_texture) {
-            const int texture_index = 0;
             p = pb_begin();
             p = xgu_set_texture_offset(p, texture_index, xgu_texture->data_physical_address);
             p = xgu_set_texture_format(p, texture_index, 2, false, XGU_SOURCE_COLOR, 2, xgu_texture->format, 1,
                                        __builtin_ctz(xgu_texture->data_width), __builtin_ctz(xgu_texture->data_height), 0);
-            p = xgu_set_texture_address(p, texture_index, XGU_CLAMP_TO_EDGE, false, XGU_CLAMP_TO_EDGE, false, XGU_CLAMP_TO_EDGE, false, false);
             p = xgu_set_texture_control0(p, texture_index, true, 0, 0);
             p = xgu_set_texture_control1(p, texture_index, xgu_texture->pitch);
             p = xgu_set_texture_image_rect(p, texture_index, xgu_texture->tex_width, xgu_texture->tex_height);
-            p = xgu_set_texture_filter(p, texture_index, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN, texture_filter, texture_filter, false, false, false, false);
             pb_end(p);
             render_data->active_texture = xgu_texture;
+            // Invalidate these so they are refreshed
+            xgu_texture->filter = -1;
+            xgu_texture->mode_u = -1;
+            xgu_texture->mode_v = -1;
+        }
+
+        // The texture could be the same but the filter could have changed
+        if (render_data->active_texture->filter != texture_filter) {
+            p = pb_begin();
+            p = xgu_set_texture_filter(p, texture_index, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN,
+                                       texture_filter, texture_filter, false, false, false, false);
+            pb_end(p);
+            xgu_texture->filter = texture_filter;
+        }
+
+        // The texture could be the same but the address mode could have changed
+        if (render_data->active_texture->mode_u != texture_address_mode_u ||
+            render_data->active_texture->mode_v != texture_address_mode_v) {
+            p = pb_begin();
+            p = xgu_set_texture_address(p, texture_index,
+                                        texture_address_mode_u, (texture_address_mode_u == XGU_WRAP),
+                                        texture_address_mode_v, (texture_address_mode_v == XGU_WRAP),
+                                        XGU_CLAMP_TO_EDGE, false, false);
+            pb_end(p);
+            xgu_texture->mode_u = texture_address_mode_u;
+            xgu_texture->mode_v = texture_address_mode_v;
         }
 
         xgu_vertex_textured_t *xgu_verts = (xgu_vertex_textured_t *)vertices;
@@ -710,7 +754,7 @@ static bool XBOX_RenderPresent(SDL_Renderer *renderer)
 {
     XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
 
-    calculate_fps(2);
+    calculate_fps(FPS_STAGE_DISPLAY);
 
     while (pb_busy()) {
         Sleep(0);
@@ -720,7 +764,7 @@ static bool XBOX_RenderPresent(SDL_Renderer *renderer)
         Sleep(0);
     }
 
-    calculate_fps(1);
+    calculate_fps(FPS_STAGE_CALCULATE);
 
     // It's probably better to wait on the vsync primitive here than it is to spin on pb_finished next loop
     pb_wait_for_vbl();
@@ -730,7 +774,7 @@ static bool XBOX_RenderPresent(SDL_Renderer *renderer)
     render_data->vertex_allocations[render_data->frame_index] = 0;
 
     // Reset for the next frame
-    calculate_fps(0);
+    calculate_fps(FPS_STAGE_RESET);
     pb_reset();
     pb_erase_depth_stencil_buffer(0, 0, pb_back_buffer_width(), pb_back_buffer_height());
     return true;
@@ -1210,7 +1254,7 @@ static float fps = 0.0f;
 // we will often just get a capped FPS. This calculates the average frame rendering time without the
 // vblank wait and then calculate the maximum 'theoretical FPS' based on that.
 // This is not perfect but it gives a better idea of the actual rendering performance.
-static void calculate_fps(int stage)
+static void calculate_fps(enum fps_stage stage)
 {
     // Stage 0 initializes the frame start time
     if (stage == 0) {
@@ -1220,14 +1264,9 @@ static void calculate_fps(int stage)
     // Stage 1 calculates the average frame time and FPS
     else if (stage == 1) {
         const int average_frame_count = 60;
-        uint64_t frame_end = SDL_GetTicksNS();
-        frame_time += (frame_end - frame_start);
+        frame_time += (SDL_GetTicksNS() - frame_start);
         if (frame_time_index++ == average_frame_count - 1) {
-            float frame_time_ms = (float)((double)frame_time / 1000000.0);
-            fps = 1000.0f * (float)average_frame_count / frame_time_ms;
-            if (fps < 5.0f) {
-                fps = 5.0f; // Cap the FPS to a minimum of 5 to avoid too low values
-            }
+            fps = 1e9f * (float)average_frame_count / (float)frame_time;
             frame_time_index = 0;
             frame_time = 0.0f;
         }
