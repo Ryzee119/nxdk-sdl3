@@ -21,11 +21,21 @@ static int texture_height = 0;
 #define WINDOW_WIDTH 640
 #define WINDOW_HEIGHT 480
 
+#include <windows.h>
+void SDL_LogOutputDebugString(void *userdata, int category, SDL_LogPriority priority, const char *message) {
+    (void)userdata;
+    (void)category;
+    (void)priority;
+    DbgPrint("%s\n", message);
+}
+
 /* This function runs once at startup. */
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
     SDL_Surface *surface = NULL;
     char *bmp_path = NULL;
+
+    SDL_SetLogOutputFunction(SDL_LogOutputDebugString, NULL);
 
     SDL_SetAppMetadata("Example Renderer Affine Textures", "1.0", "com.example.renderer-affine-textures");
 
