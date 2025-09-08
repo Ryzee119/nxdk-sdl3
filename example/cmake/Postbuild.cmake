@@ -3,7 +3,7 @@ file(MAKE_DIRECTORY ${XBOX_ISO_DIR})
 
 message(STATUS "Copying assets to XBOX ISO directory")
 file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/assets/"
-     DESTINATION "${XBOX_ISO_DIR}")
+     DESTINATION "${XBOX_ISO_DIR}/assets")
 
 #Convert the exe to xbe
 add_custom_target(cxbe_convert ALL
