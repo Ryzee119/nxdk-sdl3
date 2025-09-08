@@ -6,7 +6,7 @@
 #define SDL_build_config_h_
 
 // Prevent inclusion of unwanted Windows calls
-#define _INCLUDED_WINDOWS_H
+#define SDL_windows_h_
 #undef _WIN32
 #define TEXT(a) a
 
