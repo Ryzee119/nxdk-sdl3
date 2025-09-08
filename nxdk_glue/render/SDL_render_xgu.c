@@ -148,6 +148,12 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
 
     xgu_texture->tex_width = texture->w;
     xgu_texture->tex_height = texture->h;
+    xgu_texture->data_width = texture->w;
+    xgu_texture->data_height = texture->h;
+
+    // Texture must be atleast 8 bytes
+    xgu_texture->data_width = SDL_max(xgu_texture->data_width, 8 / xgu_texture->bytes_per_pixel);
+    xgu_texture->data_height = SDL_max(xgu_texture->data_height, 8 / xgu_texture->bytes_per_pixel);
 
     // Swizzled textures next to be in a power of 2 size container
     if (xgu_texture->swizzled) {
@@ -172,10 +178,6 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         xgu_texture->u_scale = (float)xgu_texture->tex_width;
         xgu_texture->v_scale = (float)xgu_texture->tex_height;
     }
-
-    // Texture must be atleast 8 bytes
-    xgu_texture->data_width = SDL_max(xgu_texture->data_width, 8 / xgu_texture->bytes_per_pixel);
-    xgu_texture->data_height = SDL_max(xgu_texture->data_height, 8 / xgu_texture->bytes_per_pixel);
 
     xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
 
