@@ -33,6 +33,8 @@
 // We offset by half a pixel so that (0,0) is exactly the top-left corner of the pixel
 #define PIXEL_BIAS (0.5f)
 
+#define SDL_XGU_RENDER_TARGET_DMA_CHANNEL 3
+
 #define XGU_MAYBE_UNUSED __attribute__((unused))
 
 // pbkit does not provide a way to see how many buffers are available, however it is currently
@@ -88,6 +90,7 @@ typedef struct xgu_render_data
     int vertex_arena_offset;
     int vertex_allocations[NXDK_PBKIT_BUFFER_COUNT];
     int frame_index;
+    struct s_CtxDma render_target_dma_ctx;
 } xgu_render_data_t;
 
 // Forward declarations
@@ -96,6 +99,7 @@ static inline void texture_combiner_apply(void);
 static inline void unlit_combiner_apply(void);
 static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode);
 static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect);
+static void set_surface_color_format(const int bpp);
 static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset);
 static bool arena_init(SDL_Renderer *renderer);
 static bool sdl_to_xgu_texture_format(SDL_PixelFormat sdl_format, int *xgu_texture_format, int *bytes_per_pixel, bool swizzled);
@@ -281,13 +285,14 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
 static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    uint32_t address, pitch, zpitch, clip_width, clip_height, format, dma_channel;
+    uint32_t pitch, zpitch, clip_width, clip_height, format, dma_channel;
     xgu_texture_t *xgu_texture = (texture) ? (xgu_texture_t *)texture->internal : NULL;
     extern unsigned int pb_ColorFmt; // From pbkit.c
 
     if (xgu_texture == NULL) {
+        set_surface_color_format(XVideoGetMode().bpp);
+
         dma_channel = DMA_CHANNEL_PIXEL_RENDERER;
-        address = 0;
         pitch = pb_back_buffer_pitch();
         clip_width = pb_back_buffer_width();
         clip_height = pb_back_buffer_height();
@@ -299,8 +304,10 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
         // All the checks during texture creation should ensure this never fails
         assert(status);
 
-        dma_channel = DMA_CHANNEL_3D_3;
-        address = (uint32_t)xgu_texture->data_physical_address;
+        pb_set_dma_address(&render_data->render_target_dma_ctx, xgu_texture->data, xgu_texture->pitch * xgu_texture->data_height - 1);
+        set_surface_color_format(bytes_per_pixel * 8);
+
+        dma_channel = render_data->render_target_dma_ctx.ChannelID;
         pitch = xgu_texture->pitch;
         clip_width = xgu_texture->tex_width;
         clip_height = xgu_texture->tex_height;
@@ -322,7 +329,7 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
     p = pb_push1(p, NV097_SET_SURFACE_PITCH,
                  XGU_MASK(NV097_SET_SURFACE_PITCH_COLOR, pitch) |
                      XGU_MASK(NV097_SET_SURFACE_PITCH_ZETA, zpitch));
-    p = pb_push1(p, NV097_SET_SURFACE_COLOR_OFFSET, address);
+    p = pb_push1(p, NV097_SET_SURFACE_COLOR_OFFSET, 0); // This is offset from the DMA address
     p = pb_push1(p, NV097_SET_SURFACE_CLIP_HORIZONTAL,
                  XGU_MASK(NV097_SET_SURFACE_CLIP_HORIZONTAL_WIDTH, clip_width) |
                      XGU_MASK(NV097_SET_SURFACE_CLIP_HORIZONTAL_X, 0));
@@ -824,13 +831,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
 
     // Change the framebuffer surface format based on the video mode
     const VIDEO_MODE vm = XVideoGetMode();
-    if (vm.bpp == 16) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
-    } else if (vm.bpp == 15) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
-    } else {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
-    }
+    set_surface_color_format(vm.bpp);
 
     while (pb_init() < 0) {
         DbgPrint("[nxdk renderer] pbkit initialization failed, retrying...\n");
@@ -892,6 +893,9 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     p = xgu_set_viewport_scale(p, 1.0f, 1.0f, 1.0f, 1.0f);
     p = xgu_set_scissor_rect(p, false, 0, 0, pb_back_buffer_width(), pb_back_buffer_height());
     pb_end(p);
+
+    pb_create_dma_ctx(SDL_XGU_RENDER_TARGET_DMA_CHANNEL, DMA_CLASS_3D, 0, MAXRAM, &render_data->render_target_dma_ctx);
+    pb_bind_channel(&render_data->render_target_dma_ctx);
 
     renderer->WindowEvent = XBOX_WindowEvent;
     renderer->CreateTexture = XBOX_CreateTexture;
@@ -971,6 +975,7 @@ static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surfa
     case SDL_PIXELFORMAT_RGB565:
         *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5;
         *bytes_per_pixel = 2;
+        return true;
     case SDL_PIXELFORMAT_XRGB8888:
     case SDL_PIXELFORMAT_ARGB8888:
         *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8;
@@ -1152,6 +1157,17 @@ static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *re
     }
 
     return scissor_rect;
+}
+
+static void set_surface_color_format(const int bpp)
+{
+    if (bpp == 16) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
+    } else if (bpp == 15) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
+    } else {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
+    }
 }
 
 // clang-format off
