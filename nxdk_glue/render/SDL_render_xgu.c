@@ -31,7 +31,7 @@
 
 // Xbox GPU defines pixel centers at integer coordinates: (0,0)
 // We offset by half a pixel so that (0,0) is exactly the top-left corner of the pixel
-#define PIXEL_BIAS (0.5f)
+#define SDL_XGU_PIXEL_BIAS (0.5f)
 
 #define SDL_XGU_RENDER_TARGET_DMA_CHANNEL 3
 
@@ -452,7 +452,7 @@ static bool XBOX_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cm
     scissor_clipped_rect = sanitize_scissor_rect(renderer, &scissor_clipped_rect);
 
     p = pb_begin();
-    p = xgu_set_viewport_offset(p, viewport->x + PIXEL_BIAS, viewport->y + PIXEL_BIAS, PIXEL_BIAS, PIXEL_BIAS);
+    p = xgu_set_viewport_offset(p, viewport->x + SDL_XGU_PIXEL_BIAS, viewport->y + SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS);
     p = xgu_set_scissor_rect(p, false, scissor_clipped_rect.x, scissor_clipped_rect.y,
                              scissor_clipped_rect.w, scissor_clipped_rect.h);
     pb_end(p);
@@ -889,7 +889,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     p = xgu_set_transform_execution_mode(p, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
     p = xgu_set_projection_matrix(p, m_identity);
     p = xgu_set_composite_matrix(p, m_identity);
-    p = xgu_set_viewport_offset(p, PIXEL_BIAS, PIXEL_BIAS, PIXEL_BIAS, PIXEL_BIAS);
+    p = xgu_set_viewport_offset(p, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS);
     p = xgu_set_viewport_scale(p, 1.0f, 1.0f, 1.0f, 1.0f);
     p = xgu_set_scissor_rect(p, false, 0, 0, pb_back_buffer_width(), pb_back_buffer_height());
     pb_end(p);
