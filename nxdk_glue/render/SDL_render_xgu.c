@@ -304,7 +304,14 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
         // All the checks during texture creation should ensure this never fails
         assert(status);
 
+        // Ensure idle before messing with DMA channels
+        p = pb_begin();
+        p = pb_push1(p, NV097_WAIT_FOR_IDLE, 0);
+        pb_end(p);
+
         pb_set_dma_address(&render_data->render_target_dma_ctx, xgu_texture->data, xgu_texture->pitch * xgu_texture->data_height - 1);
+
+        // Ensures any surface fills are done with the appropriate colour format while rendering to this target
         set_surface_color_format(bytes_per_pixel * 8);
 
         dma_channel = render_data->render_target_dma_ctx.ChannelID;
