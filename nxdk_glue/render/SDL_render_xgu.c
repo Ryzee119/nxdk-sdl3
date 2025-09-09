@@ -911,6 +911,9 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     renderer->window = window;
     renderer->name = "nxdk_xgu";
 
+    // Texture wrapping is only supported by swizzled POT textures.
+    renderer->npot_texture_wrap_unsupported = true;
+
     arena_init(renderer);
 
     // Initialize the default clip rect and viewport
