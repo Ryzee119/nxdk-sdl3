@@ -62,18 +62,18 @@ typedef struct xgu_texture
 
 typedef struct xgu_point
 {
-    int16_t pos[2]; // xy
+    float pos[2]; // xy
 } xgu_point_t;
 
 typedef struct xgu_vertex
 {
-    int16_t pos[2];   // xy
+    float pos[2];   // xy
     uint8_t color[4]; // rgba8888
 } xgu_vertex_t;
 
 typedef struct xgu_vertex_texture
 {
-    int16_t pos[2];   // xy
+    float pos[2];   // xy
     uint8_t color[4]; // rgba8888
     float tex[2];     // uv
 } xgu_vertex_textured_t;
@@ -362,8 +362,8 @@ static bool XBOX_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
 
     for (int i = 0; i < count; i++) {
         xgu_point_t *point = (xgu_point_t *)vertices;
-        point->pos[0] = (int16_t)(points[i].x);
-        point->pos[1] = (int16_t)(points[i].y);
+        point->pos[0] = points[i].x + SDL_XGU_PIXEL_BIAS;
+        point->pos[1] = points[i].y + SDL_XGU_PIXEL_BIAS;
         vertices += sizeof(xgu_point_t);
     }
     cmd->data.draw.count = count;
@@ -412,8 +412,8 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
         // Populate the common vertex data
         const float *vertex_pos = (float *)((char *)xy + j * xy_stride);
         xgu_vertex_t *xgu_vertex = (xgu_vertex_t *)vertices;
-        xgu_vertex->pos[0] = (int16_t)(vertex_pos[0] * scale_x);
-        xgu_vertex->pos[1] = (int16_t)(vertex_pos[1] * scale_y);
+        xgu_vertex->pos[0] = vertex_pos[0] * scale_x;
+        xgu_vertex->pos[1] = vertex_pos[1] * scale_y;
         xgu_vertex->color[0] = (uint8_t)SDL_min(r, UINT8_MAX);
         xgu_vertex->color[1] = (uint8_t)SDL_min(g, UINT8_MAX);
         xgu_vertex->color[2] = (uint8_t)SDL_min(b, UINT8_MAX);
@@ -459,7 +459,7 @@ static bool XBOX_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cm
     scissor_clipped_rect = sanitize_scissor_rect(renderer, &scissor_clipped_rect);
 
     p = pb_begin();
-    p = xgu_set_viewport_offset(p, viewport->x + SDL_XGU_PIXEL_BIAS, viewport->y + SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS);
+    p = xgu_set_viewport_offset(p, viewport->x, viewport->y, 0.0f, 0.0f);
     p = xgu_set_scissor_rect(p, false, scissor_clipped_rect.x, scissor_clipped_rect.y,
                              scissor_clipped_rect.w, scissor_clipped_rect.h);
     pb_end(p);
@@ -601,7 +601,7 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
         }
 
         xgu_vertex_textured_t *xgu_verts = (xgu_vertex_textured_t *)vertices;
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
+        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
                                 SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_textured_t), xgu_verts->pos);
         xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
                                 SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_textured_t), xgu_verts->color);
@@ -618,7 +618,7 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_Rend
         }
 
         xgu_vertex_t *xgu_verts = (xgu_vertex_t *)vertices;
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
+        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
                                 SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_t), xgu_verts->pos);
         xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
                                 SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_t), xgu_verts->color);
@@ -637,7 +637,7 @@ static bool XBOX_RenderPoints(SDL_Renderer *renderer, void *vertices, SDL_Render
     set_blend_mode(renderer, cmd->data.draw.blend);
 
     xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
-    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
+    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
                             SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
     xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
     xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
@@ -654,7 +654,7 @@ static bool XBOX_RenderLines(SDL_Renderer *renderer, void *vertices, SDL_RenderC
     set_blend_mode(renderer, cmd->data.draw.blend);
 
     xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
-    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_SHORT,
+    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
                             SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
     xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
     xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
@@ -896,7 +896,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     p = xgu_set_transform_execution_mode(p, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
     p = xgu_set_projection_matrix(p, m_identity);
     p = xgu_set_composite_matrix(p, m_identity);
-    p = xgu_set_viewport_offset(p, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS, SDL_XGU_PIXEL_BIAS);
+    p = xgu_set_viewport_offset(p, 0.0f, 0.0f, 0.0f, 0.0f);
     p = xgu_set_viewport_scale(p, 1.0f, 1.0f, 1.0f, 1.0f);
     p = xgu_set_scissor_rect(p, false, 0, 0, pb_back_buffer_width(), pb_back_buffer_height());
     pb_end(p);
