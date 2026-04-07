@@ -58,7 +58,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL3_image
   GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
-  GIT_TAG "release-3.2.4"
+  GIT_TAG "release-3.4.2"
 )
 FetchContent_MakeAvailable(SDL3_image)
 target_link_libraries(myapp PRIVATE SDL3::SDL3 SDL3_image::SDL3_image)
@@ -97,7 +97,7 @@ set(SDLMIXER_WAVPACK OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL3_mixer
   GIT_REPOSITORY https://github.com/libsdl-org/SDL_mixer.git
-  GIT_TAG main # No release tag yet for SDL3 (FIXME when available)
+  GIT_TAG "release-3.2.0"
 )
 FetchContent_MakeAvailable(SDL3_mixer)
 target_link_libraries(myapp PRIVATE SDL3::SDL3 SDL3_mixer::SDL3_mixer)
