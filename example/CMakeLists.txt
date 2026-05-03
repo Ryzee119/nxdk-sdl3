@@ -16,7 +16,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL3_image
   GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
-  GIT_TAG "release-3.4.2"
+  GIT_TAG "release-3.4.4"
 )
 FetchContent_MakeAvailable(SDL3_image)
 target_link_libraries(sdl3-test PRIVATE SDL3::SDL3 SDL3_image::SDL3_image)
