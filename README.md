@@ -98,7 +98,7 @@ set(SDLMIXER_GME OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL3_mixer
   GIT_REPOSITORY https://github.com/libsdl-org/SDL_mixer.git
-  GIT_TAG "release-3.2.0"
+  GIT_TAG "release-3.2.4"
 )
 FetchContent_MakeAvailable(SDL3_mixer)
 target_link_libraries(myapp PRIVATE SDL3::SDL3 SDL3_mixer::SDL3_mixer)
