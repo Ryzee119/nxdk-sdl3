@@ -39,6 +39,18 @@ char *SDL_SYS_GetBasePath(void)
     return SDL_strdup(base_path);
 }
 
+char *SDL_SYS_GetExeName(void)
+{
+    char path[MAX_PATH];
+    nxGetCurrentXbeNtPath(path);
+    char *ptr = SDL_strrchr(path, '\\');
+    if (ptr == NULL) {
+        return NULL;
+    }
+    ptr++;
+    return SDL_strdup(ptr);
+}
+
 char *SDL_SYS_GetPrefPath(const char *org, const char *app)
 {
     (void)org;
