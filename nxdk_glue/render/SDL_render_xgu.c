@@ -173,7 +173,7 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     // Render targets need to have a pitch that is a multiple of 64 bytes,
     else if (is_render_target) {
         const int pixel_multiple = (64 / xgu_texture->bytes_per_pixel);
-        xgu_texture->data_width += pixel_multiple - (xgu_texture->tex_width % pixel_multiple);
+        xgu_texture->data_width = (xgu_texture->tex_width + pixel_multiple - 1) & ~(pixel_multiple - 1);
 
         xgu_texture->u_scale = (float)xgu_texture->tex_width;
         xgu_texture->v_scale = (float)xgu_texture->tex_height;
@@ -378,7 +378,6 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
     SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     const int count = indices ? num_indices : num_vertices;
     const size_t sz = (texture) ? sizeof(xgu_vertex_textured_t) : sizeof(xgu_vertex_t);
-    const float color_scale = cmd->data.draw.color_scale;
 
     uint8_t *vertices = (uint8_t *)arena_allocate(renderer, count * sz, &cmd->data.draw.first);
     if (vertices == NULL) {
@@ -388,46 +387,71 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
     cmd->data.draw.count = count;
     size_indices = indices ? size_indices : 0;
 
-    for (int i = 0; i < count; i++) {
-        int j;
-        if (size_indices == 4) {
-            j = ((const uint32_t *)indices)[i];
-        } else if (size_indices == 2) {
-            j = ((const uint16_t *)indices)[i];
-        } else if (size_indices == 1) {
-            j = ((const uint8_t *)indices)[i];
-        } else {
-            j = i;
+    const float color_scale = cmd->data.draw.color_scale;
+    const float r_scale = color_scale * 255.0f;
+    const float g_scale = color_scale * 255.0f;
+    const float b_scale = color_scale * 255.0f;
+    const float a_scale = 255.0f; // Alpha does not use color_scale
+
+    if (texture) {
+        xgu_vertex_textured_t *out_verts = (xgu_vertex_textured_t *)vertices;
+        const xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
+        const float u_scale = xgu_texture->u_scale;
+        const float v_scale = xgu_texture->v_scale;
+
+        for (int i = 0; i < count; i++) {
+            int j;
+            if (size_indices == 4) {
+                j = ((const uint32_t *)indices)[i];
+            } else if (size_indices == 2) {
+                j = ((const uint16_t *)indices)[i];
+            } else if (size_indices == 1) {
+                j = ((const uint8_t *)indices)[i];
+            } else {
+                j = i;
+            }
+
+            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+            const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
+
+            // Cast directly to uint8_t using pre-scaled floats
+            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
+            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
+            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
+            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
+            out_verts[i].tex[0] = vertex_uv[0] * u_scale;
+            out_verts[i].tex[1] = vertex_uv[1] * v_scale;
         }
+    } else {
+        xgu_vertex_t *out_verts = (xgu_vertex_t *)vertices;
 
-        // We could keep the color as four floats but we can save alot of vertex buffer space making it uint_8_t
-        const SDL_FColor *vertex_color = (SDL_FColor *)((intptr_t)color + j * color_stride);
-        const uint32_t r = (uint32_t)(vertex_color->r * color_scale * 255.0f);
-        const uint32_t g = (uint32_t)(vertex_color->g * color_scale * 255.0f);
-        const uint32_t b = (uint32_t)(vertex_color->b * color_scale * 255.0f);
-        const uint32_t a = (uint32_t)(vertex_color->a * 255.0f);
+        for (int i = 0; i < count; i++) {
+            int j;
+            if (size_indices == 4) {
+                j = ((const uint32_t *)indices)[i];
+            } else if (size_indices == 2) {
+                j = ((const uint16_t *)indices)[i];
+            } else if (size_indices == 1) {
+                j = ((const uint8_t *)indices)[i];
+            } else {
+                j = i;
+            }
 
-        // Populate the common vertex data
-        const float *vertex_pos = (float *)((char *)xy + j * xy_stride);
-        xgu_vertex_t *xgu_vertex = (xgu_vertex_t *)vertices;
-        xgu_vertex->pos[0] = vertex_pos[0] * scale_x;
-        xgu_vertex->pos[1] = vertex_pos[1] * scale_y;
-        xgu_vertex->color[0] = (uint8_t)SDL_min(r, UINT8_MAX);
-        xgu_vertex->color[1] = (uint8_t)SDL_min(g, UINT8_MAX);
-        xgu_vertex->color[2] = (uint8_t)SDL_min(b, UINT8_MAX);
-        xgu_vertex->color[3] = (uint8_t)SDL_min(a, UINT8_MAX);
+            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
 
-        if (texture) {
-            xgu_vertex_textured_t *xgu_texture_vertex = (xgu_vertex_textured_t *)vertices;
-            const xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
-            const float *vertex_uv = (float *)((char *)uv + j * uv_stride);
-            xgu_texture_vertex->tex[0] = vertex_uv[0] * xgu_texture->u_scale;
-            xgu_texture_vertex->tex[1] = vertex_uv[1] * xgu_texture->v_scale;
-            vertices += sizeof(xgu_vertex_textured_t);
-        } else {
-            vertices += sizeof(xgu_vertex_t);
+            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
+            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
+            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
+            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
         }
     }
+
     return true;
 }
 
@@ -1315,7 +1339,7 @@ static void calculate_fps(enum fps_stage stage)
     }
 }
 #else
-static void calculate_fps(int stage)
+static void calculate_fps(enum fps_stage stage)
 {
     (void)stage;
 }
