@@ -12,6 +12,10 @@ This is a SDL3 implementation that works with [nxdk](https://github.com/XboxDev/
 * Filesystem API
 * Time API (System time and local time)
 
+## Prerequisites
+* **Clang 19+**: Required because `nxaudio` uses the C23 `#embed` directive (or Clang `#embed` extension) to embed compiled DSP binaries.
+* **Rust & Cargo**: Required to install the `dsp56300-asm` DSP assembler (`cargo install dsp56300-asm`) used by `nxaudio` during the build to compile `passthrough.a56` -> `passthrough.out`.
+
 ## Not supported
 * SDL_gpu.h API
 
