@@ -127,10 +127,21 @@ set(USB_INCLUDE_DIRS ${NXDK_DIR}/lib/usb/libusbohci/inc ${NXDK_DIR}/lib/usb/libu
 set(USB_DEFINES USBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\")
 target_include_directories(SDL3-static PRIVATE ${USB_INCLUDE_DIRS})
 target_compile_definitions(SDL3-static PRIVATE ${USB_DEFINES})
-target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/nxdk_usb.lib)
-
 # Link pbkit for graphics
 target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/libpbkit.lib)
+
+# Fetch and link nxdk-audio
+include(FetchContent)
+set(NXAUDIO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    nxdk_audio
+    GIT_REPOSITORY https://github.com/Ryzee119/nxdk-audio.git
+    GIT_TAG master
+)
+FetchContent_MakeAvailable(nxdk_audio)
+
+target_link_libraries(SDL3-static PUBLIC nxaudio)
+target_include_directories(SDL3-static PRIVATE ${nxdk_audio_SOURCE_DIR}/include)
 
 # Link automount support for BasePath D:\\
 target_link_libraries(SDL3-static PUBLIC ${NXDK_DIR}/lib/libnxdk_automount_d.lib)
