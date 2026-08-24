@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "swizzle.h"
@@ -81,7 +82,7 @@ static void generate_swizzle_masks(unsigned int width,
     *mask_z = z;
 }
 
-static inline void swizzle_box_internal(
+static void swizzle_box_internal(
     const uint8_t *src_buf,
     unsigned int width,
     unsigned int height,
@@ -94,40 +95,62 @@ static inline void swizzle_box_internal(
     uint32_t mask_x, mask_y, mask_z;
     generate_swizzle_masks(width, height, depth, &mask_x, &mask_y, &mask_z);
 
-    /*
-     * Map linear texture to swizzled texture using swizzle masks.
-     * https://fgiesen.wordpress.com/2011/01/17/texture-tiling-and-swizzling/
-     */
+    uint32_t x_offsets_stack[2048];
+    uint32_t *x_lut = (width <= 2048) ? x_offsets_stack : (uint32_t *)malloc(width * sizeof(uint32_t));
+    if (x_lut == NULL) {
+        return;
+    }
 
-    int x, y, z;
-    int off_z = 0;
-    for (z = 0; z < depth; z++) {
-        int off_y = 0;
-        for (y = 0; y < height; y++) {
-            int off_x = 0;
-            const uint8_t *src_tmp = src_buf + y * row_pitch;
-            uint8_t *dst_tmp = dst_buf + (off_y + off_z) * bytes_per_pixel;
-            for (x = 0; x < width; x++) {
-                const uint8_t *src = src_tmp + x * bytes_per_pixel;
-                uint8_t *dst = dst_tmp + off_x * bytes_per_pixel;
-                memcpy(dst, src, bytes_per_pixel);
+    uint32_t off_x = 0;
+    for (unsigned int x = 0; x < width; x++) {
+        x_lut[x] = off_x;
+        off_x = (off_x - mask_x) & mask_x;
+    }
 
-                /*
-                 * Increment x offset, letting the increment
-                 * ripple through bits that aren't in the mask.
-                 * Equivalent to:
-                 * off_x = (off_x + (~mask_x + 1)) & mask_x;
-                 */
-                off_x = (off_x - mask_x) & mask_x;
+    uint32_t off_z = 0;
+    for (unsigned int z = 0; z < depth; z++) {
+        uint32_t off_y = 0;
+        for (unsigned int y = 0; y < height; y++) {
+            const uint8_t *src_row = src_buf + y * row_pitch;
+            const uint32_t base_dst_idx = off_y + off_z;
+
+            if (bytes_per_pixel == 4) {
+                const uint32_t *src32 = (const uint32_t *)src_row;
+                uint32_t *dst32 = (uint32_t *)dst_buf + base_dst_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst32[x_lut[x]] = src32[x];
+                }
+            } else if (bytes_per_pixel == 2) {
+                const uint16_t *src16 = (const uint16_t *)src_row;
+                uint16_t *dst16 = (uint16_t *)dst_buf + base_dst_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst16[x_lut[x]] = src16[x];
+                }
+            } else if (bytes_per_pixel == 1) {
+                const uint8_t *src8 = src_row;
+                uint8_t *dst8 = dst_buf + base_dst_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst8[x_lut[x]] = src8[x];
+                }
+            } else {
+                uint8_t *dst_tmp = dst_buf + base_dst_idx * bytes_per_pixel;
+                for (unsigned int x = 0; x < width; x++) {
+                    memcpy(dst_tmp + x_lut[x] * bytes_per_pixel, src_row + x * bytes_per_pixel, bytes_per_pixel);
+                }
             }
+
             off_y = (off_y - mask_y) & mask_y;
         }
         src_buf += slice_pitch;
         off_z = (off_z - mask_z) & mask_z;
     }
+
+    if (x_lut != x_offsets_stack) {
+        free(x_lut);
+    }
 }
 
-static inline void unswizzle_box_internal(
+static void unswizzle_box_internal(
     const uint8_t *src_buf,
     unsigned int width,
     unsigned int height,
@@ -140,57 +163,83 @@ static inline void unswizzle_box_internal(
     uint32_t mask_x, mask_y, mask_z;
     generate_swizzle_masks(width, height, depth, &mask_x, &mask_y, &mask_z);
 
-    int x, y, z;
-    int off_z = 0;
-    for (z = 0; z < depth; z++) {
-        int off_y = 0;
-        for (y = 0; y < height; y++) {
-            int off_x = 0;
-            const uint8_t *src_tmp = src_buf + (off_y + off_z) * bytes_per_pixel;
-            uint8_t *dst_tmp = dst_buf + y * row_pitch;
-            for (x = 0; x < width; x++) {
-                const uint8_t *src = src_tmp + off_x * bytes_per_pixel;
-                uint8_t *dst = dst_tmp + x * bytes_per_pixel;
-                memcpy(dst, src, bytes_per_pixel);
+    uint32_t x_offsets_stack[2048];
+    uint32_t *x_lut = (width <= 2048) ? x_offsets_stack : (uint32_t *)malloc(width * sizeof(uint32_t));
+    if (x_lut == NULL) {
+        return;
+    }
 
-                off_x = (off_x - mask_x) & mask_x;
+    uint32_t off_x = 0;
+    for (unsigned int x = 0; x < width; x++) {
+        x_lut[x] = off_x;
+        off_x = (off_x - mask_x) & mask_x;
+    }
+
+    uint32_t off_z = 0;
+    for (unsigned int z = 0; z < depth; z++) {
+        uint32_t off_y = 0;
+        for (unsigned int y = 0; y < height; y++) {
+            uint8_t *dst_row = dst_buf + y * row_pitch;
+            const uint32_t base_src_idx = off_y + off_z;
+
+            if (bytes_per_pixel == 4) {
+                uint32_t *dst32 = (uint32_t *)dst_row;
+                const uint32_t *src32 = (const uint32_t *)src_buf + base_src_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst32[x] = src32[x_lut[x]];
+                }
+            } else if (bytes_per_pixel == 2) {
+                uint16_t *dst16 = (uint16_t *)dst_row;
+                const uint16_t *src16 = (const uint16_t *)src_buf + base_src_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst16[x] = src16[x_lut[x]];
+                }
+            } else if (bytes_per_pixel == 1) {
+                uint8_t *dst8 = dst_row;
+                const uint8_t *src8 = src_buf + base_src_idx;
+                for (unsigned int x = 0; x < width; x++) {
+                    dst8[x] = src8[x_lut[x]];
+                }
+            } else {
+                const uint8_t *src_tmp = src_buf + base_src_idx * bytes_per_pixel;
+                for (unsigned int x = 0; x < width; x++) {
+                    memcpy(dst_row + x * bytes_per_pixel, src_tmp + x_lut[x] * bytes_per_pixel, bytes_per_pixel);
+                }
             }
+
             off_y = (off_y - mask_y) & mask_y;
         }
         dst_buf += slice_pitch;
         off_z = (off_z - mask_z) & mask_z;
     }
+
+    if (x_lut != x_offsets_stack) {
+        free(x_lut);
+    }
 }
 
-/* Multiversioned to optimize for common bytes_per_pixel */         \
-#define C(m, bpp)                                                   \
-    m##_internal(src_buf, width, height, depth, dst_buf, row_pitch, \
-                 slice_pitch, bpp)
-#define MULTIVERSION(m)                                                     \
-    void m(const uint8_t *src_buf, unsigned int width, unsigned int height, \
-           unsigned int depth, uint8_t *dst_buf, unsigned int row_pitch,    \
-           unsigned int slice_pitch, unsigned int bytes_per_pixel)          \
-    {                                                                       \
-        switch (bytes_per_pixel) {                                          \
-        case 1:                                                             \
-            C(m, 1);                                                        \
-            break;                                                          \
-        case 2:                                                             \
-            C(m, 2);                                                        \
-            break;                                                          \
-        case 3:                                                             \
-            C(m, 3);                                                        \
-            break;                                                          \
-        case 4:                                                             \
-            C(m, 4);                                                        \
-            break;                                                          \
-        default:                                                            \
-            C(m, bytes_per_pixel);                                          \
-        }                                                                   \
-    }
+void swizzle_box(
+    const uint8_t *src_buf,
+    unsigned int width,
+    unsigned int height,
+    unsigned int depth,
+    uint8_t *dst_buf,
+    unsigned int row_pitch,
+    unsigned int slice_pitch,
+    unsigned int bytes_per_pixel)
+{
+    swizzle_box_internal(src_buf, width, height, depth, dst_buf, row_pitch, slice_pitch, bytes_per_pixel);
+}
 
-MULTIVERSION(swizzle_box)
-MULTIVERSION(unswizzle_box)
-
-#undef C
-#undef MULTIVERSION
+void unswizzle_box(
+    const uint8_t *src_buf,
+    unsigned int width,
+    unsigned int height,
+    unsigned int depth,
+    uint8_t *dst_buf,
+    unsigned int row_pitch,
+    unsigned int slice_pitch,
+    unsigned int bytes_per_pixel)
+{
+    unswizzle_box_internal(src_buf, width, height, depth, dst_buf, row_pitch, slice_pitch, bytes_per_pixel);
+}
