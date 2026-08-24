@@ -14,12 +14,24 @@ jobs:
         fetch-depth: 0
         fetch-tags: true
 
+    - name: Set up Rust for DSP Assembler
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dsp56300-asm
+      run: |
+        cargo install dsp56300-asm --root /tmp/dsp_tools
+        mkdir -p /tmp/cargo_bin
+        cp /tmp/dsp_tools/bin/dsp56300-asm /tmp/cargo_bin/
+
     - name: Test compile program with CMake and Make
       run: |
         docker run --rm \
           -v "$(pwd)":/workspace -w /workspace \
+          -v /tmp/cargo_bin/dsp56300-asm:/usr/local/bin/dsp56300-asm \
           ghcr.io/xboxdev/nxdk:latest \
-          sh -c "apk add --no-cache git cargo bash && \
+          sh -c "apk add --no-cache git bash && \
                 git config --global --add safe.directory /workspace && \
+                mkdir -p build/_deps/nxdk_audio-build/cargo/bin && \
+                ln -sf /usr/local/bin/dsp56300-asm build/_deps/nxdk_audio-build/cargo/bin/dsp56300-asm && \
                 cmake -B build -DCMAKE_TOOLCHAIN_FILE=/usr/src/nxdk/share/toolchain-nxdk.cmake -DSDL3WRAPPER_BUILD_EXAMPLE=ON && \
                 cmake --build build -j"
