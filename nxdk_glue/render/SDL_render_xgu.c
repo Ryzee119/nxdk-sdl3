@@ -369,6 +369,15 @@ static bool XBOX_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
     return true;
 }
 
+static inline uint32_t pack_rgba8888(const SDL_FColor *c, float r_scale, float g_scale, float b_scale, float a_scale)
+{
+    const uint32_t r = (uint32_t)(c->r * r_scale);
+    const uint32_t g = (uint32_t)(c->g * g_scale);
+    const uint32_t b = (uint32_t)(c->b * b_scale);
+    const uint32_t a = (uint32_t)(c->a * a_scale);
+    return (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | ((a & 0xFF) << 24);
+}
+
 static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL_Texture *texture,
                                const float *xy, int xy_stride, const SDL_FColor *color, int color_stride,
                                const float *uv, int uv_stride,
@@ -399,56 +408,106 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
         const float u_scale = xgu_texture->u_scale;
         const float v_scale = xgu_texture->v_scale;
 
-        for (int i = 0; i < count; i++) {
-            int j;
-            if (size_indices == 4) {
-                j = ((const uint32_t *)indices)[i];
-            } else if (size_indices == 2) {
-                j = ((const uint16_t *)indices)[i];
-            } else if (size_indices == 1) {
-                j = ((const uint8_t *)indices)[i];
-            } else {
-                j = i;
+        if (size_indices == 2) {
+            const uint16_t *idx16 = (const uint16_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = idx16[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+                const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
+
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+                out_verts[i].tex[0] = vertex_uv[0] * u_scale;
+                out_verts[i].tex[1] = vertex_uv[1] * v_scale;
             }
+        } else if (size_indices == 4) {
+            const uint32_t *idx32 = (const uint32_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = (int)idx32[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+                const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
 
-            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
-            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
-            const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+                out_verts[i].tex[0] = vertex_uv[0] * u_scale;
+                out_verts[i].tex[1] = vertex_uv[1] * v_scale;
+            }
+        } else if (size_indices == 1) {
+            const uint8_t *idx8 = (const uint8_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = idx8[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+                const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
 
-            // Cast directly to uint8_t using pre-scaled floats
-            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
-            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
-            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
-            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
-            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
-            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
-            out_verts[i].tex[0] = vertex_uv[0] * u_scale;
-            out_verts[i].tex[1] = vertex_uv[1] * v_scale;
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+                out_verts[i].tex[0] = vertex_uv[0] * u_scale;
+                out_verts[i].tex[1] = vertex_uv[1] * v_scale;
+            }
+        } else {
+            for (int i = 0; i < count; i++) {
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + i * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + i * xy_stride);
+                const float *vertex_uv = (const float *)((const char *)uv + i * uv_stride);
+
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+                out_verts[i].tex[0] = vertex_uv[0] * u_scale;
+                out_verts[i].tex[1] = vertex_uv[1] * v_scale;
+            }
         }
     } else {
         xgu_vertex_t *out_verts = (xgu_vertex_t *)vertices;
 
-        for (int i = 0; i < count; i++) {
-            int j;
-            if (size_indices == 4) {
-                j = ((const uint32_t *)indices)[i];
-            } else if (size_indices == 2) {
-                j = ((const uint16_t *)indices)[i];
-            } else if (size_indices == 1) {
-                j = ((const uint8_t *)indices)[i];
-            } else {
-                j = i;
+        if (size_indices == 2) {
+            const uint16_t *idx16 = (const uint16_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = idx16[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
             }
+        } else if (size_indices == 4) {
+            const uint32_t *idx32 = (const uint32_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = (int)idx32[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
 
-            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
-            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+            }
+        } else if (size_indices == 1) {
+            const uint8_t *idx8 = (const uint8_t *)indices;
+            for (int i = 0; i < count; i++) {
+                const int j = idx8[i];
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
 
-            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
-            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
-            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
-            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
-            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
-            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+            }
+        } else {
+            for (int i = 0; i < count; i++) {
+                const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + i * color_stride);
+                const float *vertex_pos = (const float *)((const char *)xy + i * xy_stride);
+
+                out_verts[i].pos[0] = vertex_pos[0] * scale_x;
+                out_verts[i].pos[1] = vertex_pos[1] * scale_y;
+                *(uint32_t *)out_verts[i].color = pack_rgba8888(vertex_color, r_scale, g_scale, b_scale, a_scale);
+            }
         }
     }
 
