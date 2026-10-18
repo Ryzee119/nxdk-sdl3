@@ -23,6 +23,7 @@
 
 #define MAX_JOYSTICKS        CONFIG_XID_MAX_DEV
 #define MAX_PACKET_SIZE      32
+#define XID_PACKET_HEADER    0x1400
 #define XID_GAMEPAD_RPT_LEN  20
 #define BUTTON_DEADZONE      0x20
 #define HUB_POLL_INTERVAL_MS 100
@@ -65,8 +66,7 @@ typedef struct joystick_hwdata
     bool read_pending;
 } joystick_hwdata, *pjoystick_hwdata;
 
-static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, Uint8 *rdata);
-
+static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, const Uint8 *rdata);
 static Sint32 SDL_XBOX_JoystickGetDevicePlayerIndex(Sint32 device_index);
 
 // Interrupt-safe ring buffer to push controller connection events for processing
@@ -273,7 +273,6 @@ static int SDL_XBOX_JoystickGetCount(void)
     int pad_cnt = 0;
     xid_dev_t *xid_dev = usbh_xid_get_device_list();
     while (xid_dev != NULL) {
-        // FIXME: Include xremote and steel battalion in the joystick API.
         if (xid_dev->xid_desc.bType == XID_TYPE_GAMECONTROLLER) {
             pad_cnt++;
         }
@@ -423,7 +422,6 @@ static SDL_JoystickID SDL_XBOX_JoystickGetDeviceInstanceID(Sint32 device_index)
 static bool SDL_XBOX_JoystickOpen(SDL_Joystick *joystick, int device_index)
 {
     xid_dev_t *xid_dev = xid_from_device_index(device_index);
-
     if (xid_dev == NULL) {
         JOY_DBGMSG("SDL_XBOX_JoystickOpen: Could not find device index %i\n", device_index);
         return false;
@@ -539,10 +537,6 @@ static bool SDL_XBOX_JoystickSetSensorsEnabled(SDL_Joystick *joystick, bool enab
 
 static void SDL_XBOX_JoystickUpdate(SDL_Joystick *joystick)
 {
-    Sint16 wButtons, axis;
-    Sint32 hat = SDL_HAT_CENTERED;
-    XINPUT_GAMEPAD xpad;
-
     if (joystick == NULL || joystick->hwdata == NULL || joystick->hwdata->xid_dev == NULL) {
         return;
     }
@@ -574,71 +568,60 @@ static void SDL_XBOX_JoystickUpdate(SDL_Joystick *joystick)
         return;
     }
 
-    Uint64 timestamp = SDL_GetTicksNS();
-
-    // FIXME. Steel Battalion and XREMOTE should be parsed differently.
-    if (parse_input_data(joystick->hwdata->xid_dev, &xpad, button_data)) {
-        wButtons = xpad.wButtons;
-
-        // HAT
-        if (wButtons & XINPUT_GAMEPAD_DPAD_UP)
-            hat |= SDL_HAT_UP;
-        if (wButtons & XINPUT_GAMEPAD_DPAD_DOWN)
-            hat |= SDL_HAT_DOWN;
-        if (wButtons & XINPUT_GAMEPAD_DPAD_LEFT)
-            hat |= SDL_HAT_LEFT;
-        if (wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)
-            hat |= SDL_HAT_RIGHT;
-        if (hat != joystick->hats[0]) {
-            SDL_SendJoystickHat(timestamp, joystick, 0, hat);
-        }
-
-        // DIGITAL BUTTONS
-        const Sint32 btn_map[10][2] = {
-            { SDL_GAMEPAD_BUTTON_SOUTH, XINPUT_GAMEPAD_A },
-            { SDL_GAMEPAD_BUTTON_EAST, XINPUT_GAMEPAD_B },
-            { SDL_GAMEPAD_BUTTON_WEST, XINPUT_GAMEPAD_X },
-            { SDL_GAMEPAD_BUTTON_NORTH, XINPUT_GAMEPAD_Y },
-            { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER },
-            { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER },
-            { SDL_GAMEPAD_BUTTON_BACK, XINPUT_GAMEPAD_BACK },
-            { SDL_GAMEPAD_BUTTON_START, XINPUT_GAMEPAD_START },
-            { SDL_GAMEPAD_BUTTON_LEFT_STICK, XINPUT_GAMEPAD_LEFT_THUMB },
-            { SDL_GAMEPAD_BUTTON_RIGHT_STICK, XINPUT_GAMEPAD_RIGHT_THUMB }
-        };
-
-        for (Uint32 i = 0; i < (sizeof(btn_map) / sizeof(btn_map[0])); i++) {
-            if (joystick->buttons[btn_map[i][0]] != ((wButtons & btn_map[i][1]) > 0))
-                SDL_SendJoystickButton(timestamp, joystick, btn_map[i][0], (wButtons & btn_map[i][1]) ? true : false);
-        }
-
-        // TRIGGERS
-        // LEFT TRIGGER (0-255 must be converted to signed short)
-        if (xpad.bLeftTrigger != joystick->axes[SDL_GAMEPAD_AXIS_LEFT_TRIGGER].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, ((xpad.bLeftTrigger << 8) | xpad.bLeftTrigger) - (1 << 15));
-        // RIGHT TRIGGER (0-255 must be converted to signed short)
-        if (xpad.bRightTrigger != joystick->axes[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, ((xpad.bRightTrigger << 8) | xpad.bRightTrigger) - (1 << 15));
-
-        // ANALOG STICKS
-        // LEFT X-AXIS
-        axis = xpad.sThumbLX;
-        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_LEFTX].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTX, axis);
-        // LEFT Y-AXIS
-        axis = xpad.sThumbLY;
-        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_LEFTY].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTY, ~axis);
-        // RIGHT X-AXIS
-        axis = xpad.sThumbRX;
-        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_RIGHTX].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTX, axis);
-        // RIGHT Y-AXIS
-        axis = xpad.sThumbRY;
-        if (axis != joystick->axes[SDL_GAMEPAD_AXIS_RIGHTY].value)
-            SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTY, ~axis);
+    XINPUT_GAMEPAD xpad;
+    if (!parse_input_data(joystick->hwdata->xid_dev, &xpad, button_data)) {
+        return;
     }
-    return;
+
+    Uint64 timestamp = SDL_GetTicksNS();
+    Uint16 wButtons = xpad.wButtons;
+    Uint8 hat = SDL_HAT_CENTERED;
+
+    // HAT
+    if (wButtons & XINPUT_GAMEPAD_DPAD_UP) {
+        hat |= SDL_HAT_UP;
+    }
+    if (wButtons & XINPUT_GAMEPAD_DPAD_DOWN) {
+        hat |= SDL_HAT_DOWN;
+    }
+    if (wButtons & XINPUT_GAMEPAD_DPAD_LEFT) {
+        hat |= SDL_HAT_LEFT;
+    }
+    if (wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) {
+        hat |= SDL_HAT_RIGHT;
+    }
+    SDL_SendJoystickHat(timestamp, joystick, 0, hat);
+
+    // DIGITAL BUTTONS
+    static const Sint32 btn_map[10][2] = {
+        { SDL_GAMEPAD_BUTTON_SOUTH, XINPUT_GAMEPAD_A },
+        { SDL_GAMEPAD_BUTTON_EAST, XINPUT_GAMEPAD_B },
+        { SDL_GAMEPAD_BUTTON_WEST, XINPUT_GAMEPAD_X },
+        { SDL_GAMEPAD_BUTTON_NORTH, XINPUT_GAMEPAD_Y },
+        { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER },
+        { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER },
+        { SDL_GAMEPAD_BUTTON_BACK, XINPUT_GAMEPAD_BACK },
+        { SDL_GAMEPAD_BUTTON_START, XINPUT_GAMEPAD_START },
+        { SDL_GAMEPAD_BUTTON_LEFT_STICK, XINPUT_GAMEPAD_LEFT_THUMB },
+        { SDL_GAMEPAD_BUTTON_RIGHT_STICK, XINPUT_GAMEPAD_RIGHT_THUMB }
+    };
+
+    for (Uint32 i = 0; i < SDL_arraysize(btn_map); i++) {
+        bool down = (wButtons & btn_map[i][1]) != 0;
+        SDL_SendJoystickButton(timestamp, joystick, (Uint8)btn_map[i][0], down);
+    }
+
+    // TRIGGERS (0..255 mapped to -32768..32767)
+    Sint16 left_trig = (Sint16)(((Sint32)((xpad.bLeftTrigger << 8) | xpad.bLeftTrigger)) - 32768);
+    Sint16 right_trig = (Sint16)(((Sint32)((xpad.bRightTrigger << 8) | xpad.bRightTrigger)) - 32768);
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, left_trig);
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, right_trig);
+
+    // ANALOG STICKS (Y-axes inverted using bitwise NOT to avoid -(-32768) overflow)
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTX, xpad.sThumbLX);
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFTY, ~xpad.sThumbLY);
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTX, xpad.sThumbRX);
+    SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHTY, ~xpad.sThumbRY);
 }
 
 static void SDL_XBOX_JoystickClose(SDL_Joystick *joystick)
@@ -681,7 +664,6 @@ static bool SDL_XBOX_JoystickGetGamepadMapping(int device_index, SDL_GamepadMapp
 }
 
 SDL_JoystickDriver SDL_XBOX_JoystickDriver = {
-
     .Init = SDL_XBOX_JoystickInit,
     .GetCount = SDL_XBOX_JoystickGetCount,
     .Detect = SDL_XBOX_JoystickDetect,
@@ -705,14 +687,21 @@ SDL_JoystickDriver SDL_XBOX_JoystickDriver = {
     .GetGamepadMapping = SDL_XBOX_JoystickGetGamepadMapping
 };
 
-static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, Uint8 *rdata)
+static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, const Uint8 *rdata)
 {
-
-    if (xid_dev == NULL) {
+    if (xid_dev == NULL || controller == NULL || rdata == NULL) {
         return 0;
     }
 
-    Uint16 wButtons = *((Uint16 *)&rdata[2]);
+    // Validate XID gamepad input report header (bReportId = 0x00, bLength = 0x14)
+    Uint16 header;
+    SDL_memcpy(&header, &rdata[0], sizeof(Uint16));
+    if (header != XID_PACKET_HEADER) {
+        return 0;
+    }
+
+    Uint16 wButtons;
+    SDL_memcpy(&wButtons, &rdata[2], sizeof(Uint16));
     controller->wButtons = 0;
 
     // Map digital buttons
@@ -752,9 +741,10 @@ static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, U
     controller->bRightTrigger = rdata[11];
 
     // Map analog sticks
-    controller->sThumbLX = *((Sint16 *)&rdata[12]);
-    controller->sThumbLY = *((Sint16 *)&rdata[14]);
-    controller->sThumbRX = *((Sint16 *)&rdata[16]);
-    controller->sThumbRY = *((Sint16 *)&rdata[18]);
+    SDL_memcpy(&controller->sThumbLX, &rdata[12], sizeof(Sint16));
+    SDL_memcpy(&controller->sThumbLY, &rdata[14], sizeof(Sint16));
+    SDL_memcpy(&controller->sThumbRX, &rdata[16], sizeof(Sint16));
+    SDL_memcpy(&controller->sThumbRY, &rdata[18], sizeof(Sint16));
+
     return 1;
 }
