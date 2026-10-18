@@ -319,6 +319,23 @@ static void handle_action_toggle_pause(uint32_t sim_frame) {
   }
 }
 
+#ifdef NXDK
+#include <xboxkrnl/xboxkrnl.h>
+
+static void SDLCALL NXDK_LogOutput(void *userdata, int category,
+                                   SDL_LogPriority priority,
+                                   const char *message) {
+  (void)userdata;
+  (void)category;
+  (void)priority;
+
+  /* DbgPrint accepts a format string followed by arguments.
+     Always pass message as an argument rather than the format string directly
+     to prevent format-string injection if the message contains '%' */
+  DbgPrint("%s\n", message);
+}
+#endif
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -330,6 +347,7 @@ int main(int argc, char **argv) {
   }
 
 #if defined(NXDK) || defined(__XBOX__)
+  SDL_SetLogOutputFunction(NXDK_LogOutput, NULL);
   const SDL_WindowFlags win_flags = SDL_WINDOW_FULLSCREEN;
 #else
   const SDL_WindowFlags win_flags = 0;
