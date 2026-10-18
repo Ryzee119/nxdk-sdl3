@@ -4,6 +4,7 @@
 
 #include "SDL_xboxjoystick.h"
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_timer.h>
 
 #include <assert.h>
 #include <usbh_lib.h>
@@ -20,9 +21,10 @@
 #define JOY_DBGMSG(...)
 #endif
 
-#define MAX_JOYSTICKS   CONFIG_XID_MAX_DEV
-#define MAX_PACKET_SIZE 32
-#define BUTTON_DEADZONE 0x20
+#define MAX_JOYSTICKS        CONFIG_XID_MAX_DEV
+#define MAX_PACKET_SIZE      32
+#define BUTTON_DEADZONE      0x20
+#define HUB_POLL_INTERVAL_MS 100
 
 // XINPUT defines and struct format from
 // https://docs.microsoft.com/en-us/windows/win32/api/xinput/ns-xinput-xinput_gamepad
@@ -66,45 +68,60 @@ static Sint32 parse_input_data(xid_dev_t *xid_dev, PXINPUT_GAMEPAD controller, U
 
 static Sint32 SDL_XBOX_JoystickGetDevicePlayerIndex(Sint32 device_index);
 
-// We need a interrupt safe queue to push controller connection events for processing
-// in SDL main thread
+// Interrupt-safe ring buffer to push controller connection events for processing
+// on the SDL main thread
 typedef struct controller_connection_event
 {
     uint32_t uid;
     bool connected;
 } controller_connection_event_t;
+
 static controller_connection_event_t uid_event_queue[8];
-static SDL_AtomicInt uid_event_queue_index;
-static uint32_t uid_event_processed_index = 0;
+static uint32_t uid_event_write_index = 0;
+static uint32_t uid_event_read_index = 0;
+static Uint64 last_hub_poll_ms = 0;
+
+static void push_connection_event(uint32_t uid, bool connected)
+{
+    KIRQL prev_irql = KeRaiseIrqlToDpcLevel();
+    uint32_t next_index = (uid_event_write_index + 1) % SDL_arraysize(uid_event_queue);
+    if (next_index != uid_event_read_index) {
+        uid_event_queue[uid_event_write_index].uid = uid;
+        uid_event_queue[uid_event_write_index].connected = connected;
+        uid_event_write_index = next_index;
+    }
+    KfLowerIrql(prev_irql);
+}
+
+static bool pop_connection_event(controller_connection_event_t *out_event)
+{
+    bool has_event = false;
+    KIRQL prev_irql = KeRaiseIrqlToDpcLevel();
+    if (uid_event_read_index != uid_event_write_index) {
+        *out_event = uid_event_queue[uid_event_read_index];
+        uid_event_read_index = (uid_event_read_index + 1) % SDL_arraysize(uid_event_queue);
+        has_event = true;
+    }
+    KfLowerIrql(prev_irql);
+    return has_event;
+}
 
 static void connection_callback(xid_dev_t *xid_dev, int status)
 {
     (void)status;
-    int old_value = SDL_GetAtomicInt(&uid_event_queue_index);
-    int new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
-
-    uid_event_queue[old_value].uid = xid_dev->uid;
-    uid_event_queue[old_value].connected = true;
-
-    while (!SDL_CompareAndSwapAtomicInt(&uid_event_queue_index, old_value, new_value)) {
-        old_value = SDL_GetAtomicInt(&uid_event_queue_index);
-        new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+    if (xid_dev == NULL || xid_dev->xid_desc.bType != XID_TYPE_GAMECONTROLLER) {
+        return;
     }
+    push_connection_event(xid_dev->uid, true);
 }
 
 static void disconnect_callback(xid_dev_t *xid_dev, int status)
 {
     (void)status;
-    int old_value = SDL_GetAtomicInt(&uid_event_queue_index);
-    int new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
-
-    uid_event_queue[old_value].uid = xid_dev->uid;
-    uid_event_queue[old_value].connected = false;
-
-    while (!SDL_CompareAndSwapAtomicInt(&uid_event_queue_index, old_value, new_value)) {
-        old_value = SDL_GetAtomicInt(&uid_event_queue_index);
-        new_value = (old_value + 1) % SDL_arraysize(uid_event_queue);
+    if (xid_dev == NULL || xid_dev->xid_desc.bType != XID_TYPE_GAMECONTROLLER) {
+        return;
     }
+    push_connection_event(xid_dev->uid, false);
 }
 
 static void int_read_callback(UTR_T *utr)
@@ -181,6 +198,12 @@ static Sint32 xid_get_device_port(xid_dev_t *xid_dev)
 static bool core_has_init = false;
 static bool SDL_XBOX_JoystickInit(void)
 {
+    KIRQL prev_irql = KeRaiseIrqlToDpcLevel();
+    uid_event_write_index = 0;
+    uid_event_read_index = 0;
+    KfLowerIrql(prev_irql);
+
+    bool already_initialized = core_has_init;
     if (!core_has_init) {
         usbh_core_init();
         usbh_xid_init();
@@ -188,15 +211,27 @@ static bool SDL_XBOX_JoystickInit(void)
     }
     usbh_install_xid_conn_callback(connection_callback, disconnect_callback);
 
+    if (already_initialized) {
+        // Re-enqueue already-enumerated controllers if the subsystem was re-initialized
+        xid_dev_t *xid_dev = usbh_xid_get_device_list();
+        while (xid_dev != NULL) {
+            if (xid_dev->xid_desc.bType == XID_TYPE_GAMECONTROLLER) {
+                push_connection_event(xid_dev->uid, true);
+            }
+            xid_dev = xid_dev->next;
+        }
+    } else {
 #ifndef SDL_DISABLE_JOYSTICK_INIT_DELAY
-    // Ensure all connected devices have completed enumeration and are running
-    // This wouldnt be required if user applications correctly handled connection events, but most dont
-    // This needs to allow time for port reset, debounce, device reset etc. ~200ms per device. ~500ms is time for 1 hub + 1 controller.
-    for (Sint32 i = 0; i < 500; i++) {
-        usbh_pooling_hubs();
-        SDL_Delay(1);
-    }
+        // Ensure all connected devices have completed enumeration and are running.
+        // ~200ms per device; ~500ms is time for 1 hub + 1 controller.
+        for (Sint32 i = 0; i < 500; i++) {
+            usbh_pooling_hubs();
+            SDL_Delay(1);
+        }
 #endif
+    }
+
+    last_hub_poll_ms = SDL_GetTicks();
     return true;
 }
 
@@ -217,24 +252,26 @@ static int SDL_XBOX_JoystickGetCount(void)
 
 static void SDL_XBOX_JoystickDetect(void)
 {
-    usbh_pooling_hubs();
+    Uint64 now = SDL_GetTicks();
+    if ((now - last_hub_poll_ms) >= HUB_POLL_INTERVAL_MS) {
+        usbh_pooling_hubs();
+        last_hub_poll_ms = now;
+    }
 
     // Process any queued connection events
-    int queued_pos = SDL_GetAtomicInt(&uid_event_queue_index);
-    while (uid_event_processed_index != queued_pos) {
-        controller_connection_event_t *event = &uid_event_queue[uid_event_processed_index];
-        if (event->connected) {
-            JOY_DBGMSG("connection_callback: uid %i connected \n", event->uid);
-            SDL_PrivateJoystickAdded(event->uid);
-            SDL_SetGamepadMapping(event->uid,
-                                  "default,Original Xbox Controller,*,"
+    controller_connection_event_t event;
+    while (pop_connection_event(&event)) {
+        if (event.connected) {
+            JOY_DBGMSG("connection_callback: uid %u connected\n", event.uid);
+            SDL_PrivateJoystickAdded(event.uid);
+            SDL_SetGamepadMapping(event.uid,
+                                  "default,Original Xbox Controller,"
                                   "a:b0,b:b1,back:b4,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,leftshoulder:b9,leftstick:b7,lefttrigger:a4,"
                                   "leftx:a0,lefty:a1,rightshoulder:b10,rightstick:b8,righttrigger:a5,rightx:a2,righty:a3,start:b6,x:b2,y:b3,");
         } else {
-            JOY_DBGMSG("disconnect_callback uid %i disconnected\n", event->uid);
-            SDL_PrivateJoystickRemoved(event->uid);
+            JOY_DBGMSG("disconnect_callback: uid %u disconnected\n", event.uid);
+            SDL_PrivateJoystickRemoved(event.uid);
         }
-        uid_event_processed_index = (uid_event_processed_index + 1) % SDL_arraysize(uid_event_queue);
     }
 }
 
@@ -566,7 +603,7 @@ static void SDL_XBOX_JoystickQuit(void)
 {
     JOY_DBGMSG("SDL_XBOX_JoystickQuit\n");
     usbh_install_xid_conn_callback(NULL, NULL);
-    // We dont call usbh_core_deinit() here incase the user is using
+    // We don't call usbh_core_deinit() here in case the user is using
     // the USB stack in other parts of their application other than game controllers.
 }
 
