@@ -147,36 +147,43 @@ static void int_read_callback(UTR_T *utr)
 
 static xid_dev_t *xid_from_device_index(Sint32 device_index)
 {
-    xid_dev_t *xid_dev = usbh_xid_get_device_list();
+    if (device_index < 0) {
+        return NULL;
+    }
 
+    xid_dev_t *xid_dev = usbh_xid_get_device_list();
     Sint32 i = 0;
-    // Scan the xid_dev linked list and finds the nth xid_dev that is a gamepad.
-    while (xid_dev != NULL && i <= device_index) {
-        // FIXME: Include xremote and steel battalion in the joystick API.
+
+    // Scan the xid_dev linked list and find the nth xid_dev that is a gamepad.
+    while (xid_dev != NULL) {
         if (xid_dev->xid_desc.bType == XID_TYPE_GAMECONTROLLER) {
-            if (i == device_index)
+            if (i == device_index) {
                 return xid_dev;
+            }
             i++;
         }
         xid_dev = xid_dev->next;
     }
-    assert(0);
     return NULL;
 }
 
 static Sint32 xid_get_device_port(xid_dev_t *xid_dev)
 {
-    UDEV_T *udev, *parent_udev;
+    if (xid_dev == NULL || xid_dev->iface == NULL) {
+        return 0;
+    }
 
-    udev = xid_dev->iface->udev;
+    UDEV_T *udev = xid_dev->iface->udev;
     ULONG has_internal_hub = XboxHardwareInfo.Flags & XBOX_HW_FLAG_INTERNAL_USB_HUB;
+
     while (udev != NULL) {
-        parent_udev = NULL;
-        if (udev->parent != NULL) {
+        UDEV_T *parent_udev = NULL;
+        if (udev->parent != NULL && udev->parent->iface != NULL) {
             parent_udev = udev->parent->iface->udev;
         }
 
-        if ((has_internal_hub && parent_udev->parent == NULL) || (!has_internal_hub && udev->parent == NULL)) {
+        if ((has_internal_hub && parent_udev != NULL && parent_udev->parent == NULL) ||
+            (!has_internal_hub && udev->parent == NULL)) {
             switch (udev->port_num) {
             case 3:
                 return 1;
@@ -281,7 +288,9 @@ static bool SDL_XBOX_JoystickIsDevicePresent(Uint16 vendor_id, Uint16 product_id
     (void)name;
     xid_dev_t *xid_dev = usbh_xid_get_device_list();
     while (xid_dev != NULL) {
-        if (xid_dev->idVendor == vendor_id && xid_dev->idProduct == product_id) {
+        if (xid_dev->xid_desc.bType == XID_TYPE_GAMECONTROLLER &&
+            xid_dev->idVendor == vendor_id &&
+            xid_dev->idProduct == product_id) {
             return true;
         }
         xid_dev = xid_dev->next;
@@ -291,24 +300,32 @@ static bool SDL_XBOX_JoystickIsDevicePresent(Uint16 vendor_id, Uint16 product_id
 
 static const char *SDL_XBOX_JoystickGetDeviceName(int device_index)
 {
-    xid_dev_t *xid_dev = xid_from_device_index(device_index);
-
-    if (xid_dev == NULL || device_index >= MAX_JOYSTICKS)
+    if (device_index < 0 || device_index >= MAX_JOYSTICKS) {
         return "Invalid device index";
+    }
+
+    xid_dev_t *xid_dev = xid_from_device_index(device_index);
+    if (xid_dev == NULL) {
+        return "Invalid device index";
+    }
 
     static char name[MAX_JOYSTICKS][64];
     Uint32 max_len = sizeof(name[device_index]);
 
-    Sint32 player_index = SDL_XBOX_JoystickGetDevicePlayerIndex(device_index);
+    // Player index is 0-based in SDL3; add 1 for human-readable controller numbering
+    Sint32 player_num = SDL_XBOX_JoystickGetDevicePlayerIndex(device_index) + 1;
     switch (xid_dev->xid_desc.bType) {
     case XID_TYPE_GAMECONTROLLER:
-        SDL_snprintf(name[device_index], max_len, "Original Xbox Controller #%u", player_index);
+        SDL_snprintf(name[device_index], max_len, "Original Xbox Controller #%d", (int)player_num);
         break;
     case XID_TYPE_XREMOTE:
-        SDL_snprintf(name[device_index], max_len, "Original Xbox IR Remote #%u", player_index);
+        SDL_snprintf(name[device_index], max_len, "Original Xbox IR Remote #%d", (int)player_num);
         break;
     case XID_TYPE_STEELBATTALION:
-        SDL_snprintf(name[device_index], max_len, "Steel Battalion Controller #%u", player_index);
+        SDL_snprintf(name[device_index], max_len, "Steel Battalion Controller #%d", (int)player_num);
+        break;
+    default:
+        SDL_snprintf(name[device_index], max_len, "Original Xbox Device #%d", (int)player_num);
         break;
     }
 
@@ -327,20 +344,16 @@ static int SDL_XBOX_JoystickGetDeviceSteamVirtualGamepadSlot(int device_index)
     return -1;
 }
 
-// Returns the port number the device is connected to
-// 1 = Port 1, 2 = Port 2, etc.
+// Returns the 0-based player index corresponding to the physical port (0 = Port 1, 1 = Port 2, etc.)
 static Sint32 SDL_XBOX_JoystickGetDevicePlayerIndex(Sint32 device_index)
 {
     xid_dev_t *xid_dev = xid_from_device_index(device_index);
-
     if (xid_dev == NULL) {
         return -1;
     }
 
-    Sint32 player_index = xid_get_device_port(xid_dev);
-    if (player_index == 0) { // fallback to device_index if xid_get_device_port fails (returns 0)
-        player_index = device_index;
-    }
+    Sint32 port = xid_get_device_port(xid_dev);
+    Sint32 player_index = (port > 0) ? (port - 1) : device_index;
     JOY_DBGMSG("SDL_XBOX_JoystickGetDevicePlayerIndex: %i\n", player_index);
 
     return player_index;
@@ -373,15 +386,12 @@ static SDL_GUID SDL_XBOX_JoystickGetDeviceGUID(Sint32 device_index)
 static SDL_JoystickID SDL_XBOX_JoystickGetDeviceInstanceID(Sint32 device_index)
 {
     xid_dev_t *xid_dev = xid_from_device_index(device_index);
-
-    SDL_JoystickID ret;
-    SDL_zero(ret);
-
-    if (xid_dev != NULL) {
-        SDL_memcpy(&ret, &xid_dev->uid, sizeof(xid_dev->uid));
+    if (xid_dev == NULL) {
+        return 0;
     }
-    JOY_DBGMSG("SDL_XBOX_JoystickGetDeviceInstanceID: %i\n", xid_dev->uid);
-    return ret;
+
+    JOY_DBGMSG("SDL_XBOX_JoystickGetDeviceInstanceID: %u\n", xid_dev->uid);
+    return (SDL_JoystickID)xid_dev->uid;
 }
 
 static bool SDL_XBOX_JoystickOpen(SDL_Joystick *joystick, int device_index)
