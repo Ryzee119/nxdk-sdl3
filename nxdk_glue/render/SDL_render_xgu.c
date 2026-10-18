@@ -41,21 +41,22 @@
 
 typedef struct xgu_texture
 {
-    int data_width;
-    int data_height;
     int tex_width;
     int tex_height;
-    int bytes_per_pixel;
+    int data_width;
+    int data_height;
     int pitch;
+    int bytes_per_pixel;
     int swizzled;
+    XguTexFormatColor format;
     float u_scale;
     float v_scale;
-    XguTexFormatColor format;
     XguTexFilter filter;
     XguTextureAddress mode_u;
     XguTextureAddress mode_v;
     uint8_t *data;
     uint8_t *data_physical_address;
+    uint32_t last_used_epoch;
 } xgu_texture_t;
 
 typedef struct xgu_point
@@ -82,6 +83,7 @@ typedef struct xgu_render_data
     const xgu_texture_t *active_texture;
     xgu_texture_t *active_render_target;
     uint32_t active_surface_format;
+    uint32_t gpu_epoch;
     SDL_Rect viewport;
     SDL_Rect clip_rect;
     bool viewport_dirty;
@@ -104,6 +106,25 @@ enum fps_stage
 };
 // pushbuffer pointer
 static uint32_t *p = NULL;
+
+static inline void drain_gpu(xgu_render_data_t *render_data)
+{
+    while (pb_busy()) {
+        Sleep(0);
+    }
+    render_data->gpu_epoch++;
+}
+
+static inline void wait_texture_idle(xgu_render_data_t *render_data, xgu_texture_t *xgu_texture)
+{
+    if (xgu_texture->last_used_epoch == render_data->gpu_epoch) {
+        drain_gpu(render_data);
+    }
+    // Force xgu_set_texture_offset to re-push on next draw to invalidate NV2A texture cache
+    if (render_data->active_texture == xgu_texture) {
+        render_data->active_texture = NULL;
+    }
+}
 
 static inline void get_active_target_size(const xgu_render_data_t *render_data, int *w, int *h)
 {
@@ -166,62 +187,55 @@ static inline uint32_t npot2pot(uint32_t num)
     return 1 << (msb + 1);
 }
 
-static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel)
+static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format)
 {
     switch (sdl_format) {
     case SDL_PIXELFORMAT_RGB565:
         *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5;
-        *bytes_per_pixel = 2;
         return true;
     case SDL_PIXELFORMAT_XRGB8888:
     case SDL_PIXELFORMAT_ARGB8888:
         *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8;
-        *bytes_per_pixel = 4;
         return true;
     default:
         return false;
     }
 }
 
-static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, int *xgu_format, int *bytes_per_pixel, bool swizzled)
+
+static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, XguTexFormatColor *xgu_format, int *bytes_per_pixel, bool swizzled)
 {
+    *bytes_per_pixel = SDL_BYTESPERPIXEL(fmt);
     switch (fmt) {
     case SDL_PIXELFORMAT_ARGB1555:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_A1R5G5B5;
-        *bytes_per_pixel = 2;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_A1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_A1R5G5B5;
         return true;
     case SDL_PIXELFORMAT_RGB565:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R5G6B5_SWIZZLED : XGU_TEXTURE_FORMAT_R5G6B5;
-        *bytes_per_pixel = 2;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_R5G6B5_SWIZZLED : XGU_TEXTURE_FORMAT_R5G6B5;
         return true;
     case SDL_PIXELFORMAT_ARGB8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_A8R8G8B8;
-        *bytes_per_pixel = 4;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_A8R8G8B8;
         return true;
     case SDL_PIXELFORMAT_XRGB8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_X8R8G8B8;
-        *bytes_per_pixel = 4;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_X8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_X8R8G8B8;
         return true;
     case SDL_PIXELFORMAT_RGBA8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R8G8B8A8_SWIZZLED : XGU_TEXTURE_FORMAT_R8G8B8A8;
-        *bytes_per_pixel = 4;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_R8G8B8A8_SWIZZLED : XGU_TEXTURE_FORMAT_R8G8B8A8;
         return true;
     case SDL_PIXELFORMAT_ABGR8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8B8G8R8_SWIZZLED : XGU_TEXTURE_FORMAT_A8B8G8R8;
-        *bytes_per_pixel = 4;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_A8B8G8R8_SWIZZLED : XGU_TEXTURE_FORMAT_A8B8G8R8;
         return true;
     case SDL_PIXELFORMAT_ARGB4444:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A4R4G4B4_SWIZZLED : XGU_TEXTURE_FORMAT_A4R4G4B4;
-        *bytes_per_pixel = 2;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_A4R4G4B4_SWIZZLED : XGU_TEXTURE_FORMAT_A4R4G4B4;
         return true;
     case SDL_PIXELFORMAT_XRGB1555:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_X1R5G5B5;
-        *bytes_per_pixel = 2;
+        *xgu_format = swizzled ? XGU_TEXTURE_FORMAT_X1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_X1R5G5B5;
         return true;
     default:
         return false;
     }
 }
+
 
 static bool arena_init(SDL_Renderer *renderer)
 {
@@ -475,6 +489,70 @@ static void calculate_fps(enum fps_stage stage)
 }
 #endif
 
+static inline void generate_swizzle_masks(int width, int height, uint32_t *mask_x, uint32_t *mask_y)
+{
+    uint32_t x = 0, y = 0, mask_bit = 1;
+    for (int bit = 1; bit < width || bit < height; bit <<= 1) {
+        if (bit < width) {
+            x |= mask_bit;
+            mask_bit <<= 1;
+        }
+        if (bit < height) {
+            y |= mask_bit;
+            mask_bit <<= 1;
+        }
+    }
+    *mask_x = x;
+    *mask_y = y;
+}
+
+static inline uint32_t swizzle_coord(int val, uint32_t mask)
+{
+    uint32_t result = 0;
+    for (int bit = 1; val && mask; bit <<= 1) {
+        uint32_t lsb = mask & (~mask + 1u);
+        if (val & bit) {
+            result |= lsb;
+        }
+        mask &= ~lsb;
+    }
+    return result;
+}
+
+static void swizzle_subrect(const uint8_t *src, int src_pitch,
+                            uint8_t *dst_base, int tex_w, int tex_h, int bpp,
+                            const SDL_Rect *rect)
+{
+    uint32_t mask_x, mask_y;
+    generate_swizzle_masks(tex_w, tex_h, &mask_x, &mask_y);
+    const uint32_t start_x = swizzle_coord(rect->x, mask_x);
+    uint32_t y_ofs = swizzle_coord(rect->y, mask_y);
+
+    if (bpp == 4) {
+        uint32_t *dst32 = (uint32_t *)dst_base;
+        for (int y = 0; y < rect->h; y++) {
+            const uint32_t *src_row = (const uint32_t *)(src + y * src_pitch);
+            uint32_t x_ofs = start_x;
+            for (int x = 0; x < rect->w; x++) {
+                dst32[x_ofs | y_ofs] = src_row[x];
+                x_ofs = (x_ofs - mask_x) & mask_x;
+            }
+            y_ofs = (y_ofs - mask_y) & mask_y;
+        }
+    } else if (bpp == 2) {
+        uint16_t *dst16 = (uint16_t *)dst_base;
+        for (int y = 0; y < rect->h; y++) {
+            const uint16_t *src_row = (const uint16_t *)(src + y * src_pitch);
+            uint32_t x_ofs = start_x;
+            for (int x = 0; x < rect->w; x++) {
+                dst16[x_ofs | y_ofs] = src_row[x];
+                x_ofs = (x_ofs - mask_x) & mask_x;
+            }
+            y_ofs = (y_ofs - mask_y) & mask_y;
+        }
+    }
+}
+
 static void XBOX_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *event)
 {
     (void)renderer;
@@ -483,71 +561,54 @@ static void XBOX_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *even
 
 static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL_PropertiesID create_props)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    (void)renderer;
     xgu_texture_t *xgu_texture = (xgu_texture_t *)SDL_calloc(1, sizeof(xgu_texture_t));
     if (xgu_texture == NULL) {
         return SDL_OutOfMemory();
     }
 
-    const bool is_render_target = SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, 0) == SDL_TEXTUREACCESS_TARGET;
+    const Sint64 access = SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, 0);
+    const bool is_render_target = (access == SDL_TEXTUREACCESS_TARGET);
 
-    // If this is a render target, we need to check if the render target format is supported
-    if (is_render_target) {
-        int surface_format;
-        int bytes_per_pixel;
-        if (sdl_to_xgu_surface_format(texture->format, &surface_format, &bytes_per_pixel) == false) {
-            SDL_free(xgu_texture);
-            return SDL_SetError("[nxdk renderer] Unsupported render target format (%s)", SDL_GetPixelFormatName(texture->format));
-        }
+    int surface_format;
+    if (is_render_target && !sdl_to_xgu_surface_format(texture->format, &surface_format)) {
+        SDL_free(xgu_texture);
+        return SDL_SetError("[nxdk renderer] Unsupported render target format (%s)", SDL_GetPixelFormatName(texture->format));
     }
 
-    // If static target we swizzle it because it has better performance is should not need updating often
-    if (SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, 0) == SDL_TEXTUREACCESS_STATIC) {
+    // Swizzle static POT textures (at least 4x4) for faster sampling and hardware wrapping support
+    const bool is_pot = (texture->w >= 4) && ((texture->w & (texture->w - 1)) == 0) &&
+                        (texture->h >= 4) && ((texture->h & (texture->h - 1)) == 0);
+    if (access == SDL_TEXTUREACCESS_STATIC && is_pot) {
         xgu_texture->swizzled = 1;
     }
 
-    // Ensure the texture format is supported
-    if (sdl_to_xgu_texture_format(texture->format, &xgu_texture->format, &xgu_texture->bytes_per_pixel, xgu_texture->swizzled) == false) {
+    if (!sdl_to_xgu_texture_format(texture->format, &xgu_texture->format, &xgu_texture->bytes_per_pixel, xgu_texture->swizzled)) {
         SDL_free(xgu_texture);
         return SDL_SetError("[nxdk renderer] Unsupported texture format (%s)", SDL_GetPixelFormatName(texture->format));
     }
 
     xgu_texture->tex_width = texture->w;
     xgu_texture->tex_height = texture->h;
-    xgu_texture->data_width = texture->w;
-    xgu_texture->data_height = texture->h;
 
-    // Texture must be atleast 8 bytes
-    xgu_texture->data_width = SDL_max(xgu_texture->data_width, 8 / xgu_texture->bytes_per_pixel);
-    xgu_texture->data_height = SDL_max(xgu_texture->data_height, 8 / xgu_texture->bytes_per_pixel);
-
-    // Swizzled textures next to be in a power of 2 size container
     if (xgu_texture->swizzled) {
-        xgu_texture->data_width = npot2pot(texture->w);
-        xgu_texture->data_height = npot2pot(texture->h);
-
-        // Texture coordinates need to be normalised for swizzled textures
-        xgu_texture->u_scale = (float)xgu_texture->tex_width / (float)xgu_texture->data_width;
-        xgu_texture->v_scale = (float)xgu_texture->tex_height / (float)xgu_texture->data_height;
-    }
-    // Render targets need to have a pitch that is a multiple of 64 bytes,
-    else if (is_render_target) {
-        const int pixel_multiple = (64 / xgu_texture->bytes_per_pixel);
-        xgu_texture->data_width = (xgu_texture->tex_width + pixel_multiple - 1) & ~(pixel_multiple - 1);
-
-        xgu_texture->u_scale = (float)xgu_texture->tex_width;
-        xgu_texture->v_scale = (float)xgu_texture->tex_height;
-    } else {
         xgu_texture->data_width = texture->w;
         xgu_texture->data_height = texture->h;
-
-        xgu_texture->u_scale = (float)xgu_texture->tex_width;
-        xgu_texture->v_scale = (float)xgu_texture->tex_height;
+        xgu_texture->u_scale = 1.0f;
+        xgu_texture->v_scale = 1.0f;
+    } else {
+        // NV2A pitch alignment is 64 bytes for render targets and 8 bytes for linear textures
+        const int min_dim = 8 / xgu_texture->bytes_per_pixel;
+        const int align = (is_render_target ? 64 : 8) / xgu_texture->bytes_per_pixel;
+        xgu_texture->data_width = (texture->w + align - 1) & ~(align - 1);
+        xgu_texture->data_height = SDL_max(texture->h, min_dim);
+        xgu_texture->u_scale = (float)texture->w;
+        xgu_texture->v_scale = (float)texture->h;
     }
 
     xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
 
-    const SIZE_T allocation_size = xgu_texture->data_height * xgu_texture->pitch;
+    const SIZE_T allocation_size = (SIZE_T)xgu_texture->data_height * xgu_texture->pitch;
     xgu_texture->data = MmAllocateContiguousMemoryEx(allocation_size, 0, SDL_MAX_UINT32, 0, PAGE_WRITECOMBINE | PAGE_READWRITE);
     if (xgu_texture->data == NULL) {
         SDL_free(xgu_texture);
@@ -560,85 +621,82 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     return true;
 }
 
+
 static void XBOX_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
     if (xgu_texture == NULL) {
         return;
     }
+
+    if (render_data->active_render_target == xgu_texture) {
+        render_data->active_render_target = NULL;
+    }
+
+    wait_texture_idle(render_data, xgu_texture);
 
     MmFreeContiguousMemory(xgu_texture->data);
     SDL_free(xgu_texture);
     texture->internal = NULL;
 }
 
+
 static bool XBOX_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture, const SDL_Rect *rect, void **pixels, int *pitch)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
-    uint8_t *pixels8 = (uint8_t *)xgu_texture->data;
 
-    // We don't need to worry about unswizzling because you can only lock textures that are not swizzled
-    *pixels = &pixels8[rect->y * xgu_texture->pitch +
-                       rect->x * xgu_texture->bytes_per_pixel];
+    wait_texture_idle(render_data, xgu_texture);
 
+    *pixels = &xgu_texture->data[rect->y * xgu_texture->pitch + rect->x * xgu_texture->bytes_per_pixel];
     *pitch = xgu_texture->pitch;
     return true;
 }
+
 
 static void XBOX_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     (void)renderer;
     (void)texture;
-    return;
 }
+
 
 static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
                                const SDL_Rect *rect, const void *pixels, int pitch)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
-    const Uint8 *src = pixels;
+    const uint8_t *src = (const uint8_t *)pixels;
+
+    wait_texture_idle(render_data, xgu_texture);
 
     if (xgu_texture->swizzled) {
-        // If we are updating the entire texture, we can swizzle it entirely
         if (rect->x == 0 && rect->y == 0 &&
             rect->w == xgu_texture->tex_width && rect->h == xgu_texture->tex_height) {
-            swizzle_rect(src, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, pitch, SDL_BYTESPERPIXEL(texture->format));
-        }
-        // Otherwise we need to unswizzle, update the texture then swizzle again
-        else {
-            // Unswizzle the whole texture to a temporary buffer
-            uint8_t *unswizzled = (uint8_t *)SDL_malloc(xgu_texture->pitch * xgu_texture->tex_height);
-            if (unswizzled == NULL) {
-                return SDL_OutOfMemory();
-            }
-            unswizzle_rect(xgu_texture->data, xgu_texture->tex_width, xgu_texture->tex_height,
-                           unswizzled, xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
-
-            // Copy the new pixels into the unswizzled buffer
-            uint8_t *dst = &((uint8_t *)unswizzled)[rect->y * xgu_texture->pitch +
-                                                    rect->x * xgu_texture->bytes_per_pixel];
-            SDL_ConvertPixels(rect->w, rect->h,
-                              texture->format, src, pitch,
-                              texture->format, dst, xgu_texture->pitch);
-
-            // Now swizzle the unswizzled buffer back to the texture
-            swizzle_rect(unswizzled, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data,
-                         xgu_texture->pitch, SDL_BYTESPERPIXEL(texture->format));
-            SDL_free(unswizzled);
+            swizzle_rect(src, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, pitch, xgu_texture->bytes_per_pixel);
+        } else {
+            swizzle_subrect(src, pitch, xgu_texture->data,
+                            xgu_texture->tex_width, xgu_texture->tex_height,
+                            xgu_texture->bytes_per_pixel, rect);
         }
     } else {
-        uint8_t *dst = &((uint8_t *)xgu_texture->data)[rect->y * xgu_texture->pitch +
-                                                       rect->x * xgu_texture->bytes_per_pixel];
-        SDL_ConvertPixels(rect->w, rect->h,
-                          texture->format, src, pitch,
-                          texture->format, dst, xgu_texture->pitch);
+        uint8_t *dst = &xgu_texture->data[rect->y * xgu_texture->pitch + rect->x * xgu_texture->bytes_per_pixel];
+        const size_t row_bytes = (size_t)rect->w * xgu_texture->bytes_per_pixel;
+        if (pitch == xgu_texture->pitch && row_bytes == (size_t)xgu_texture->pitch) {
+            SDL_memcpy(dst, src, row_bytes * (size_t)rect->h);
+        } else {
+            for (int y = 0; y < rect->h; y++) {
+                SDL_memcpy(dst, src, row_bytes);
+                src += pitch;
+                dst += xgu_texture->pitch;
+            }
+        }
     }
 
     return true;
 }
+
 
 static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 {
@@ -659,9 +717,10 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
         clip_width = pb_back_buffer_width();
         clip_height = pb_back_buffer_height();
         render_data->active_surface_format = pb_ColorFmt;
+    render_data->gpu_epoch = 1;
     } else {
         int surface_format;
-        bool status = sdl_to_xgu_surface_format(texture->format, &surface_format, NULL);
+        bool status = sdl_to_xgu_surface_format(texture->format, &surface_format);
         assert(status);
 
         dma_channel = render_data->render_target_dma_ctx.ChannelID;
