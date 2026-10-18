@@ -5,6 +5,26 @@ project(SDL3Wrapper LANGUAGES C)
 set(SDL3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL)
 set(SDL3_GLUE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/nxdk_glue)
 
+if(NOT CMAKE_TOOLCHAIN_FILE)
+    # Native Linux / Windows build: build upstream SDL3 directly
+    set(SDL_TEST_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${SDL3_DIR} ${CMAKE_CURRENT_BINARY_DIR}/SDL3-build)
+
+    # Alias target compatibility
+    if(NOT TARGET SDL3::Headers)
+        if(TARGET SDL3::SDL3_headers)
+            add_library(SDL3::Headers ALIAS SDL3::SDL3_headers)
+        endif()
+    endif()
+
+    option(SDL3WRAPPER_BUILD_EXAMPLE "Build example programs" OFF)
+    if(SDL3WRAPPER_BUILD_EXAMPLE)
+        add_subdirectory(example)
+    endif()
+    return()
+endif()
+
 # === Compile Definitions ===
 set(SDL3_COMPILE_DEFS
     SDL_DISABLE_ALLOCA
