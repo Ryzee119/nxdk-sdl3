@@ -10,47 +10,60 @@
 #include <../src/render/SDL_sysrender.h>
 #include <SDL3/SDL_pixels.h>
 #include <hal/video.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define nxdk_RenderDriver GPU_RenderDriver
 
-// Note: To avoid stalls this vertex buffer must be sufficient to
-// hold three frames (pbkit is tripple buffered) worth of vertices. This is to allow for
-// both the back buffers being rendered, and the active front buffer being calculated.
+// pb_reset() drains the GPU every frame, so the entire arena is available each frame.
 #ifndef SDL_XGU_VERTEX_BUFFER_SIZE
 #define SDL_XGU_VERTEX_BUFFER_SIZE (512 * 1024)
-#endif
-
-#ifndef SDL_XGU_VERTEX_ALIGNMENT
-#define SDL_XGU_VERTEX_ALIGNMENT 32
 #endif
 
 #ifndef SDL_XGU_SHOW_FPS
 #define SDL_XGU_SHOW_FPS 0
 #endif
 
-// Xbox GPU defines pixel centers at integer coordinates: (0,0)
-// We offset by half a pixel so that (0,0) is exactly the top-left corner of the pixel for lines and dots
+// RunCommandQueue batches commands into one pushbuffer block and kicks the GPU
+// (pb_end) once this many dwords have accumulated. pbkit's pushbuffer threshold
+// reserves 128 dwords before wrap-around, so single blocks must never exceed 128
+// dwords. Keep headroom for state setup + draw packet before kicking.
+#ifndef SDL_XGU_KICK_DWORDS
+#ifdef DBG
+#define SDL_XGU_KICK_DWORDS 0
+#else
+#define SDL_XGU_KICK_DWORDS 80
+#endif
+#endif
+
+// NV2A places pixel sample centers at integer coordinates (0.0, 0.0), whereas
+// SDL3 places pixel (0, 0)'s center at (0.5, 0.5). We apply a -0.5f hardware
+// viewport offset so SDL geometry aligns with NV2A pixel/texel centers, and bias
+// integer point/line coordinates by +0.5f to land on pixel centers.
 #define SDL_XGU_PIXEL_BIAS (0.5f)
 
-#define SDL_XGU_MAYBE_UNUSED __attribute__((unused))
+// CRTC scanout start address register (see nxdk lib/pbkit/outer.h)
+#define SDL_XGU_PCRTC_START 0x00600800
 
-// pbkit does not provide a way to see how many buffers are available, however it is currently
-// hardcoded to 3 buffers.
-#define SDL_XGU_BUFFER_COUNT 3
+// Non-increasing PFIFO method flag for batching multiple NV097_DRAW_ARRAYS dwords
+#define SDL_XGU_METHOD_NON_INC 0x40000000u
+
+#ifndef NV097_INVALIDATE_VERTEX_CACHE_FILE
+#define NV097_INVALIDATE_VERTEX_CACHE_FILE 0x00001710
+#endif
 
 typedef struct xgu_texture
 {
-    int tex_width;
-    int tex_height;
     int data_width;
     int data_height;
-    int pitch;
+    int tex_width;
+    int tex_height;
     int bytes_per_pixel;
+    int pitch;
     int swizzled;
-    XguTexFormatColor format;
     float u_scale;
     float v_scale;
+    XguTexFormatColor format;
     XguTexFilter filter;
     XguTextureAddress mode_u;
     XguTextureAddress mode_v;
@@ -61,25 +74,35 @@ typedef struct xgu_texture
 
 typedef struct xgu_point
 {
-    float pos[2]; // xy
+    float pos[2];
 } xgu_point_t;
 
 typedef struct xgu_vertex
 {
-    float pos[2];     // xy
-    uint8_t color[4]; // rgba8888
+    float pos[2];
+    uint32_t color32;
 } xgu_vertex_t;
 
 typedef struct xgu_vertex_texture
 {
-    float pos[2];     // xy
-    uint8_t color[4]; // rgba8888
-    float tex[2];     // uv
+    float pos[2];
+    uint32_t color32;
+    float tex[2];
 } xgu_vertex_textured_t;
+
+typedef enum xgu_vertex_layout
+{
+    XGU_VERT_LAYOUT_UNKNOWN = 0,
+    XGU_VERT_LAYOUT_POINT,
+    XGU_VERT_LAYOUT_UNLIT,
+    XGU_VERT_LAYOUT_TEXTURED,
+} xgu_vertex_layout_t;
 
 typedef struct xgu_render_data
 {
     int texture_shader_active;
+    xgu_vertex_layout_t active_vertex_layout;
+    uint32_t active_vertex_base;
     const xgu_texture_t *active_texture;
     xgu_texture_t *active_render_target;
     uint32_t active_surface_format;
@@ -91,12 +114,10 @@ typedef struct xgu_render_data
     bool scissor_empty;
     SDL_BlendMode active_blend_mode;
     void *vertex_data;
+    uint32_t vertex_data_physical;
     int vertex_arena_offset;
-    int vertex_allocations[SDL_XGU_BUFFER_COUNT];
-    int frame_index;
     struct s_CtxDma render_target_dma_ctx;
 } xgu_render_data_t;
-
 
 enum fps_stage
 {
@@ -104,7 +125,8 @@ enum fps_stage
     FPS_STAGE_CALCULATE,
     FPS_STAGE_DISPLAY,
 };
-// pushbuffer pointer
+
+// Pushbuffer pointer
 static uint32_t *p = NULL;
 
 static inline void drain_gpu(xgu_render_data_t *render_data)
@@ -175,17 +197,42 @@ static inline uint32_t *push_current_scissor(SDL_Renderer *renderer, uint32_t *p
     return push_scissor(pb, rect.x, rect.y, rect.w, rect.h);
 }
 
-static inline uint32_t npot2pot(uint32_t num)
+#if SDL_XGU_SHOW_FPS
+static uint64_t frame_start;
+static uint64_t frame_time = 0;
+static int frame_time_index = 0;
+static float fps = 0.0f;
+
+static void calculate_fps(enum fps_stage stage)
 {
-    uint32_t msb;
-    __asm__("bsr %1, %0" : "=r"(msb) : "r"(num));
-
-    if ((1 << msb) == num) {
-        return num;
+    if (stage == FPS_STAGE_RESET) {
+        frame_start = SDL_GetTicksNS();
+    } else if (stage == FPS_STAGE_CALCULATE) {
+        const int average_frame_count = 60;
+        frame_time += (SDL_GetTicksNS() - frame_start);
+        if (frame_time_index++ == average_frame_count - 1) {
+            fps = 1e9f * (float)average_frame_count / (float)frame_time;
+            frame_time_index = 0;
+            frame_time = 0;
+        }
+    } else if (stage == FPS_STAGE_DISPLAY) {
+        char pb_text[16];
+        p = pb_begin();
+        p = push_scissor(p, 0, 0, (int)pb_back_buffer_width(), (int)pb_back_buffer_height());
+        pb_end(p);
+        pb_erase_text_screen();
+        int len = SDL_snprintf(pb_text, sizeof(pb_text), "FPS: %.02f", fps);
+        pb_fill(20, 25, len * 10, 20, 0xFF000000);
+        pb_print(pb_text);
+        pb_draw_text_screen();
     }
-
-    return 1 << (msb + 1);
 }
+#else
+static inline void calculate_fps(enum fps_stage stage)
+{
+    (void)stage;
+}
+#endif
 
 static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format)
 {
@@ -201,7 +248,6 @@ static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surfa
         return false;
     }
 }
-
 
 static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, XguTexFormatColor *xgu_format, int *bytes_per_pixel, bool swizzled)
 {
@@ -236,136 +282,80 @@ static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, XguTexFormatColor *xg
     }
 }
 
-
-static bool arena_init(SDL_Renderer *renderer)
+static void *arena_allocate(SDL_Renderer *renderer, size_t count, size_t elem_size, size_t *vertex_data_offset)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    render_data->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
-                                                            PAGE_WRITECOMBINE | PAGE_READWRITE);
-    if (render_data->vertex_data == NULL) {
-        SDL_SetError("Failed to allocate XGU arena");
-        return false;
-    }
+    const size_t size = count * elem_size;
 
-    renderer->vertex_data = render_data->vertex_data;
-    render_data->vertex_arena_offset = 0;
+    // Align to elem_size so byte_offset / elem_size is an exact vertex index for NV097_DRAW_ARRAYS.
+    // Consecutive allocations of the same elem_size already have rem == 0, preserving coalescing.
+    const size_t cur = (size_t)render_data->vertex_arena_offset;
+    const size_t rem = cur % elem_size;
+    const size_t aligned_offset = cur + (rem ? (elem_size - rem) : 0);
 
-    return true;
-}
-
-static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset)
-{
-    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    int total_allocated = 0;
-
-    // Ensure alignment. If every allocation is aligned, we know every pointer will be aligned.
-    size = (size + SDL_XGU_VERTEX_ALIGNMENT - 1) & ~(SDL_XGU_VERTEX_ALIGNMENT - 1);
-
-    if (render_data->vertex_arena_offset + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
-        // We lost some space to end padding, so ensure we tag that on when we validate our allocation size
-        total_allocated += render_data->vertex_arena_offset + size - SDL_XGU_VERTEX_BUFFER_SIZE;
-
-        // Round robin back to the start of the arena
-        render_data->vertex_arena_offset = 0;
-    }
-
-    // Area we going to overflow the vertex buffer?
-    for (int i = 0; i < SDL_XGU_BUFFER_COUNT; i++) {
-        total_allocated += render_data->vertex_allocations[i];
-    }
-    if (total_allocated + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
-        SDL_Log("Vertex buffer overflow. Increase SDL_XGU_VERTEX_BUFFER_SIZE", size);
+    if (aligned_offset + size > (size_t)SDL_XGU_VERTEX_BUFFER_SIZE) {
+        SDL_Log("Vertex buffer overflow (%zu bytes requested). Increase SDL_XGU_VERTEX_BUFFER_SIZE", size);
         return NULL;
     }
 
-    void *ptr = (void *)((intptr_t)render_data->vertex_data + render_data->vertex_arena_offset);
-    assert(((intptr_t)ptr & (SDL_XGU_VERTEX_ALIGNMENT - 1)) == 0);
-
-    *vertex_data_offset = render_data->vertex_arena_offset;
-    render_data->vertex_arena_offset += size;
-    render_data->vertex_allocations[render_data->frame_index] += size;
-    return ptr;
+    *vertex_data_offset = aligned_offset;
+    render_data->vertex_arena_offset = (int)(aligned_offset + size);
+    return (uint8_t *)render_data->vertex_data + aligned_offset;
 }
 
 static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     if (blendMode == render_data->active_blend_mode) {
         return;
     }
 
-    XguBlendFactor sfactor;
-    XguBlendFactor dfactor;
+    if (blendMode == SDL_BLENDMODE_NONE) {
+        p = xgu_set_blend_enable(p, false);
+    } else {
+        XguBlendFactor sfactor = XGU_FACTOR_SRC_ALPHA;
+        XguBlendFactor dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
 
-    switch (blendMode) {
-    case SDL_BLENDMODE_NONE:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ZERO;
-        break;
-    case SDL_BLENDMODE_BLEND:
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_BLEND_PREMULTIPLIED:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_ADD:
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE;
-        break;
-    case SDL_BLENDMODE_ADD_PREMULTIPLIED:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ONE;
-        break;
-    case SDL_BLENDMODE_MUL:
-        sfactor = XGU_FACTOR_DST_COLOR;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_MOD:
-        sfactor = XGU_FACTOR_ZERO;
-        dfactor = XGU_FACTOR_SRC_COLOR;
-        break;
-    default:
-        SDL_Log("Unsupported blend mode %d, defaulting to SDL_BLENDMODE_BLEND", blendMode);
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
+        switch (blendMode) {
+        case SDL_BLENDMODE_BLEND:
+            break;
+        case SDL_BLENDMODE_BLEND_PREMULTIPLIED:
+            sfactor = XGU_FACTOR_ONE;
+            break;
+        case SDL_BLENDMODE_ADD:
+            dfactor = XGU_FACTOR_ONE;
+            break;
+        case SDL_BLENDMODE_ADD_PREMULTIPLIED:
+            sfactor = XGU_FACTOR_ONE;
+            dfactor = XGU_FACTOR_ONE;
+            break;
+        case SDL_BLENDMODE_MUL:
+            sfactor = XGU_FACTOR_DST_COLOR;
+            break;
+        case SDL_BLENDMODE_MOD:
+            sfactor = XGU_FACTOR_ZERO;
+            dfactor = XGU_FACTOR_SRC_COLOR;
+            break;
+        default:
+            SDL_Log("Unsupported blend mode %d, defaulting to SDL_BLENDMODE_BLEND", blendMode);
+            break;
+        }
+
+        p = xgu_set_blend_enable(p, true);
+        p = xgu_set_blend_func_sfactor(p, sfactor);
+        p = xgu_set_blend_func_dfactor(p, dfactor);
+        p = push_command_parameter(p, NV097_SET_BLEND_EQUATION, NV097_SET_BLEND_EQUATION_V_FUNC_ADD);
     }
-
-    p = pb_begin();
-    p = xgu_set_blend_func_sfactor(p, sfactor);
-    p = xgu_set_blend_func_dfactor(p, dfactor);
-    p = push_command_parameter(p, NV097_SET_BLEND_EQUATION, NV097_SET_BLEND_EQUATION_V_FUNC_ADD);
-    pb_end(p);
 
     render_data->active_blend_mode = blendMode;
 }
 
-
-
 // clang-format off
 static inline void combiner_init(void)
 {
-   pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT,
-    XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE1, 0)
-    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE2, 0)
-    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE3, 0));
-    p += 2;
-    pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
-        XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE1, NV097_SET_SHADER_STAGE_PROGRAM_STAGE1_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE2, NV097_SET_SHADER_STAGE_PROGRAM_STAGE2_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE3, NV097_SET_SHADER_STAGE_PROGRAM_STAGE3_PROGRAM_NONE));
-    p += 2;
+    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
 
-    pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 0 * 4,
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 0 * 4,
         XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, 0x4)
         | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DST, 0x0)
         | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_SUM_DST, 0x0)
@@ -373,121 +363,97 @@ static inline void combiner_init(void)
         | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DOT_ENABLE, 0)
         | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DOT_ENABLE, 0)
         | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_NOSHIFT));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + 0 * 4,
+
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + 0 * 4,
         XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, 0x4)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_CD_DST, 0x0)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_SUM_DST, 0x0)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_MUX_ENABLE, 0)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_OP, NV097_SET_COMBINER_ALPHA_OCW_OP_NOSHIFT));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_CONTROL,
+
+    p = pb_push1(p, NV097_SET_COMBINER_CONTROL,
         XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR0, NV097_SET_COMBINER_CONTROL_FACTOR0_SAME_FACTOR_ALL)
         | XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR1, NV097_SET_COMBINER_CONTROL_FACTOR1_SAME_FACTOR_ALL)
         | XGU_MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 1));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0,
+
+    p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0,
         XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_INVERSE, 0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
+
+    p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
         XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_INVERSE, 0)
         | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_SPECULAR_CLAMP, 0));
-    p += 2;
 }
 
-static inline void unlit_combiner_apply (void)
+static inline void set_texture_shader(xgu_render_data_t *render_data, int textured)
 {
-    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
-    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);
+    if (render_data->texture_shader_active == textured) {
+        return;
+    }
+    render_data->texture_shader_active = textured;
+
+    const uint32_t a_src = textured ? 0x8 : 0x4;
+    const uint32_t b_src = textured ? 0x4 : 0x0;
+    const uint32_t b_map = textured ? 0x6 : 0x1;
+
+    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
+        textured ? XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE) : 0);
 
     p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
+        XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, a_src) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, b_src) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, b_map)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
 
     p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
-}
-
-static inline void texture_combiner_apply (void)
-{
-    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
-    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE));
-
-    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
-  
-    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x6)
+        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, a_src) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, b_src) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, b_map)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
         | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
 }
 // clang-format on
 
-#if SDL_XGU_SHOW_FPS
-static uint64_t frame_start;
-static uint64_t frame_time = 0;
-static int frame_time_index = 0;
-static float fps = 0.0f;
+static inline uint32_t pack_color_rgba8888(const SDL_FColor *c, float c_scale)
+{
+    uint32_t r = (uint32_t)(int)(SDL_clamp(c->r * c_scale, 0.0f, 255.0f) + 0.5f);
+    uint32_t g = (uint32_t)(int)(SDL_clamp(c->g * c_scale, 0.0f, 255.0f) + 0.5f);
+    uint32_t b = (uint32_t)(int)(SDL_clamp(c->b * c_scale, 0.0f, 255.0f) + 0.5f);
+    uint32_t a = (uint32_t)(int)(SDL_clamp(c->a * 255.0f, 0.0f, 255.0f) + 0.5f);
 
-// This calculation is a bit more complex than usual but because pbkit forces a vblank flip
-// we will often just get a capped FPS. This calculates the average frame rendering time without the
-// vblank wait and then calculate the maximum 'theoretical FPS' based on that.
-// This is not perfect but it gives a better idea of the actual rendering performance.
-static void calculate_fps(enum fps_stage stage)
-{
-    // Stage 0 initializes the frame start time
-    if (stage == 0) {
-        frame_start = SDL_GetTicksNS();
-        return;
-    }
-    // Stage 1 calculates the average frame time and FPS
-    else if (stage == 1) {
-        const int average_frame_count = 60;
-        frame_time += (SDL_GetTicksNS() - frame_start);
-        if (frame_time_index++ == average_frame_count - 1) {
-            fps = 1e9f * (float)average_frame_count / (float)frame_time;
-            frame_time_index = 0;
-            frame_time = 0.0f;
-        }
-        return;
-    }
-    // Stage 2 displays the FPS on the screen
-    else if (stage == 2) {
-        char pb_text[16];
-        pb_erase_text_screen();
-        int len = SDL_snprintf(pb_text, sizeof(pb_text), "FPS: %.02f", fps);
-        pb_fill(20, 25, len * 10, 20, 0xFF000000);
-        pb_print(pb_text);
-        pb_draw_text_screen();
-        return;
-    }
+    return r | (g << 8) | (b << 16) | (a << 24);
 }
-#else
-static void calculate_fps(enum fps_stage stage)
+
+static inline bool fcolor_bits_equal(const SDL_FColor *a, const SDL_FColor *b)
 {
-    (void)stage;
+    const uint32_t *ua = (const uint32_t *)a;
+    const uint32_t *ub = (const uint32_t *)b;
+    return ((ua[0] ^ ub[0]) | (ua[1] ^ ub[1]) | (ua[2] ^ ub[2]) | (ua[3] ^ ub[3])) == 0;
 }
-#endif
+
+static inline int get_vertex_index(const void *indices, int size_indices, int i)
+{
+    if (size_indices == 2)
+        return ((const uint16_t *)indices)[i];
+    if (size_indices == 4)
+        return (int)((const uint32_t *)indices)[i];
+    if (size_indices == 1)
+        return ((const uint8_t *)indices)[i];
+    return i;
+}
+
+static inline bool is_quad_at(const void *indices, int size_indices, int i, int v)
+{
+    return get_vertex_index(indices, size_indices, i + 0) == v + 0 &&
+           get_vertex_index(indices, size_indices, i + 1) == v + 1 &&
+           get_vertex_index(indices, size_indices, i + 2) == v + 2 &&
+           get_vertex_index(indices, size_indices, i + 3) == v + 0 &&
+           get_vertex_index(indices, size_indices, i + 4) == v + 2 &&
+           get_vertex_index(indices, size_indices, i + 5) == v + 3;
+}
 
 static inline void generate_swizzle_masks(int width, int height, uint32_t *mask_x, uint32_t *mask_y)
 {
@@ -551,6 +517,75 @@ static void swizzle_subrect(const uint8_t *src, int src_pitch,
             y_ofs = (y_ofs - mask_y) & mask_y;
         }
     }
+}
+
+static inline int bind_vertex_stream(xgu_render_data_t *render_data, xgu_vertex_layout_t layout,
+                                     uint32_t byte_offset, int count, uint32_t stride)
+{
+    uint32_t start_index = byte_offset / stride;
+    uint32_t base_phys = render_data->vertex_data_physical;
+    if (start_index + (uint32_t)count > 65535u) {
+        base_phys += byte_offset;
+        start_index = 0;
+    }
+
+    if (render_data->active_vertex_layout != layout) {
+        p = xgu_set_vertex_data_array_format(p, XGU_VERTEX_ARRAY, XGU_FLOAT, 2, stride);
+        if (layout == XGU_VERT_LAYOUT_POINT) {
+            p = xgu_set_vertex_data_array_format(p, XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0);
+        } else {
+            p = xgu_set_vertex_data_array_format(p, XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL, 4, stride);
+        }
+        p = xgu_set_vertex_data_array_format(p, XGU_TEXCOORD0_ARRAY, XGU_FLOAT,
+                                             (layout == XGU_VERT_LAYOUT_TEXTURED) ? 2 : 0,
+                                             (layout == XGU_VERT_LAYOUT_TEXTURED) ? stride : 0);
+        render_data->active_vertex_layout = layout;
+        render_data->active_vertex_base = 0;
+    }
+
+    if (render_data->active_vertex_base != base_phys) {
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + XGU_VERTEX_ARRAY * 4, base_phys);
+        if (layout != XGU_VERT_LAYOUT_POINT) {
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + XGU_COLOR_ARRAY * 4,
+                         base_phys + offsetof(xgu_vertex_t, color32));
+        }
+        if (layout == XGU_VERT_LAYOUT_TEXTURED) {
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + XGU_TEXCOORD0_ARRAY * 4,
+                         base_phys + offsetof(xgu_vertex_textured_t, tex));
+        }
+        p = pb_push1(p, NV097_INVALIDATE_VERTEX_CACHE_FILE, 0);
+        render_data->active_vertex_base = base_phys;
+    }
+
+    return (int)start_index;
+}
+
+static inline uint32_t *xgu_emit_draw_arrays(uint32_t *pb, uint32_t **block_start,
+                                             XguPrimitiveType mode, int start, int count)
+{
+    const int max_batch = (mode == XGU_TRIANGLES) ? 255 : 256;
+
+    pb = xgu_begin(pb, mode);
+
+    while (count > 0) {
+        if (pb - *block_start > SDL_XGU_KICK_DWORDS) {
+            pb_end(pb);
+            pb = pb_begin();
+            *block_start = pb;
+        }
+
+        const int num_batches = SDL_min((count + max_batch - 1) / max_batch, 32);
+        *pb++ = SDL_XGU_METHOD_NON_INC | ((uint32_t)num_batches << 18) | NV097_DRAW_ARRAYS;
+        for (int i = 0; i < num_batches; i++) {
+            int batch = SDL_min(count, max_batch);
+            *pb++ = XGU_MASK(NV097_DRAW_ARRAYS_COUNT, batch - 1) |
+                    XGU_MASK(NV097_DRAW_ARRAYS_START_INDEX, start);
+            start += batch;
+            count -= batch;
+        }
+    }
+
+    return xgu_end(pb);
 }
 
 static void XBOX_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *event)
@@ -621,7 +656,6 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
     return true;
 }
 
-
 static void XBOX_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
@@ -641,7 +675,6 @@ static void XBOX_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
     texture->internal = NULL;
 }
 
-
 static bool XBOX_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture, const SDL_Rect *rect, void **pixels, int *pitch)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
@@ -654,13 +687,11 @@ static bool XBOX_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture, const
     return true;
 }
 
-
 static void XBOX_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     (void)renderer;
     (void)texture;
 }
-
 
 static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
                                const SDL_Rect *rect, const void *pixels, int pitch)
@@ -697,7 +728,6 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
     return true;
 }
 
-
 static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
@@ -717,7 +747,6 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
         clip_width = pb_back_buffer_width();
         clip_height = pb_back_buffer_height();
         render_data->active_surface_format = pb_ColorFmt;
-    render_data->gpu_epoch = 1;
     } else {
         int surface_format;
         bool status = sdl_to_xgu_surface_format(texture->format, &surface_format);
@@ -729,6 +758,7 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
         clip_width = xgu_texture->tex_width;
         clip_height = xgu_texture->tex_height;
         render_data->active_surface_format = (uint32_t)surface_format;
+        xgu_texture->last_used_epoch = render_data->gpu_epoch;
     }
 
     const uint32_t format = XGU_MASK(NV097_SET_SURFACE_FORMAT_COLOR, render_data->active_surface_format) |
@@ -737,7 +767,7 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
     const uint32_t zpitch = pb_back_buffer_width() * 4;
 
     render_data->active_render_target = xgu_texture;
-    render_data->active_texture = NULL;
+    render_data->active_texture = NULL; // Force texture cache flush when target is later bound as texture
     render_data->viewport = (SDL_Rect){ 0, 0, (int)clip_width, (int)clip_height };
     render_data->clip_rect = render_data->viewport;
     render_data->viewport_dirty = false;
@@ -767,18 +797,14 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 
 static bool XBOX_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd, const SDL_FPoint *points, int count)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-
-    uint8_t *vertices = (uint8_t *)arena_allocate(renderer, count * sizeof(xgu_point_t), &cmd->data.draw.first);
-    if (!vertices) {
+    xgu_point_t *verts = (xgu_point_t *)arena_allocate(renderer, (size_t)count, sizeof(xgu_point_t), &cmd->data.draw.first);
+    if (!verts) {
         return SDL_OutOfMemory();
     }
 
     for (int i = 0; i < count; i++) {
-        xgu_point_t *point = (xgu_point_t *)vertices;
-        point->pos[0] = points[i].x + SDL_XGU_PIXEL_BIAS;
-        point->pos[1] = points[i].y + SDL_XGU_PIXEL_BIAS;
-        vertices += sizeof(xgu_point_t);
+        verts[i].pos[0] = points[i].x + SDL_XGU_PIXEL_BIAS;
+        verts[i].pos[1] = points[i].y + SDL_XGU_PIXEL_BIAS;
     }
     cmd->data.draw.count = count;
 
@@ -791,80 +817,85 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
                                int num_vertices, const void *indices, int num_indices, int size_indices,
                                float scale_x, float scale_y)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    const int count = indices ? num_indices : num_vertices;
-    const size_t sz = (texture) ? sizeof(xgu_vertex_textured_t) : sizeof(xgu_vertex_t);
+    size_indices = indices ? size_indices : 0;
 
-    uint8_t *vertices = (uint8_t *)arena_allocate(renderer, count * sz, &cmd->data.draw.first);
-    if (vertices == NULL) {
+    // Detect SDL quad batches (0,1,2, 0,2,3 per 4 vertices) so we can emit 4-vertex
+    // hardware XGU_QUADS instead of expanding to 6-vertex triangle pairs.
+    bool is_quad_batch = (size_indices == 2 || size_indices == 4) &&
+                         (num_vertices > 0) && ((num_vertices & 3) == 0) &&
+                         (num_indices == (num_vertices / 4) * 6);
+
+    if (is_quad_batch) {
+        for (int v = 0, i = 0; v < num_vertices; v += 4, i += 6) {
+            if (!is_quad_at(indices, size_indices, i, v)) {
+                is_quad_batch = false;
+                break;
+            }
+        }
+    }
+
+    const int count = is_quad_batch ? num_vertices : (indices ? num_indices : num_vertices);
+    const size_t sz = texture ? sizeof(xgu_vertex_textured_t) : sizeof(xgu_vertex_t);
+
+    uint8_t *vertices = (uint8_t *)arena_allocate(renderer, (size_t)count, sz, &cmd->data.draw.first);
+    if (!vertices) {
         return SDL_OutOfMemory();
     }
 
     cmd->data.draw.count = count;
-    size_indices = indices ? size_indices : 0;
+    if (is_quad_batch) {
+        // Tag bit 0 of byte offset (always 4-byte aligned) to signal XGU_QUADS
+        cmd->data.draw.first |= 1u;
+        size_indices = 0;
+    }
 
-    const float color_scale = cmd->data.draw.color_scale;
-    const float r_scale = color_scale * 255.0f;
-    const float g_scale = color_scale * 255.0f;
-    const float b_scale = color_scale * 255.0f;
-    const float a_scale = 255.0f; // Alpha does not use color_scale
+    const float c_scale = cmd->data.draw.color_scale * 255.0f;
+    const SDL_FColor *last_color_ptr = color;
+    uint32_t cached_color32 = pack_color_rgba8888(color, c_scale);
 
     if (texture) {
-        xgu_vertex_textured_t *out_verts = (xgu_vertex_textured_t *)vertices;
-        const xgu_texture_t *xgu_texture = (xgu_texture_t *)texture->internal;
-        const float u_scale = xgu_texture->u_scale;
-        const float v_scale = xgu_texture->v_scale;
+        xgu_vertex_textured_t *out = (xgu_vertex_textured_t *)vertices;
+        const xgu_texture_t *xgu_tex = (const xgu_texture_t *)texture->internal;
+        const float u_scale = xgu_tex->u_scale;
+        const float v_scale = xgu_tex->v_scale;
 
         for (int i = 0; i < count; i++) {
-            int j;
-            if (size_indices == 4) {
-                j = ((const uint32_t *)indices)[i];
-            } else if (size_indices == 2) {
-                j = ((const uint16_t *)indices)[i];
-            } else if (size_indices == 1) {
-                j = ((const uint8_t *)indices)[i];
-            } else {
-                j = i;
+            const int j = size_indices ? get_vertex_index(indices, size_indices, i) : i;
+            const float *vp = (const float *)((const char *)xy + j * xy_stride);
+            const float *vt = (const float *)((const char *)uv + j * uv_stride);
+
+            if (color_stride != 0) {
+                const SDL_FColor *fc = (const SDL_FColor *)((const char *)color + j * color_stride);
+                if (!fcolor_bits_equal(fc, last_color_ptr)) {
+                    last_color_ptr = fc;
+                    cached_color32 = pack_color_rgba8888(fc, c_scale);
+                }
             }
 
-            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
-            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
-            const float *vertex_uv = (const float *)((const char *)uv + j * uv_stride);
-
-            // Cast directly to uint8_t using pre-scaled floats
-            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
-            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
-            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
-            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
-            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
-            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
-            out_verts[i].tex[0] = vertex_uv[0] * u_scale;
-            out_verts[i].tex[1] = vertex_uv[1] * v_scale;
+            out[i].pos[0] = vp[0] * scale_x;
+            out[i].pos[1] = vp[1] * scale_y;
+            out[i].color32 = cached_color32;
+            out[i].tex[0] = vt[0] * u_scale;
+            out[i].tex[1] = vt[1] * v_scale;
         }
     } else {
-        xgu_vertex_t *out_verts = (xgu_vertex_t *)vertices;
+        xgu_vertex_t *out = (xgu_vertex_t *)vertices;
 
         for (int i = 0; i < count; i++) {
-            int j;
-            if (size_indices == 4) {
-                j = ((const uint32_t *)indices)[i];
-            } else if (size_indices == 2) {
-                j = ((const uint16_t *)indices)[i];
-            } else if (size_indices == 1) {
-                j = ((const uint8_t *)indices)[i];
-            } else {
-                j = i;
+            const int j = size_indices ? get_vertex_index(indices, size_indices, i) : i;
+            const float *vp = (const float *)((const char *)xy + j * xy_stride);
+
+            if (color_stride != 0) {
+                const SDL_FColor *fc = (const SDL_FColor *)((const char *)color + j * color_stride);
+                if (!fcolor_bits_equal(fc, last_color_ptr)) {
+                    last_color_ptr = fc;
+                    cached_color32 = pack_color_rgba8888(fc, c_scale);
+                }
             }
 
-            const SDL_FColor *vertex_color = (const SDL_FColor *)((const char *)color + j * color_stride);
-            const float *vertex_pos = (const float *)((const char *)xy + j * xy_stride);
-
-            out_verts[i].pos[0] = vertex_pos[0] * scale_x;
-            out_verts[i].pos[1] = vertex_pos[1] * scale_y;
-            out_verts[i].color[0] = (uint8_t)(vertex_color->r * r_scale);
-            out_verts[i].color[1] = (uint8_t)(vertex_color->g * g_scale);
-            out_verts[i].color[2] = (uint8_t)(vertex_color->b * b_scale);
-            out_verts[i].color[3] = (uint8_t)(vertex_color->a * a_scale);
+            out[i].pos[0] = vp[0] * scale_x;
+            out[i].pos[1] = vp[1] * scale_y;
+            out[i].color32 = cached_color32;
         }
     }
 
@@ -891,10 +922,8 @@ static bool XBOX_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cm
     render_data->viewport = *viewport;
     render_data->viewport_dirty = false;
 
-    p = pb_begin();
     p = xgu_set_viewport_offset(p, (float)viewport->x, (float)viewport->y, 0.0f, 0.0f);
     p = push_current_scissor(renderer, p);
-    pb_end(p);
 
     return true;
 }
@@ -915,20 +944,7 @@ static bool XBOX_RenderSetClipRect(SDL_Renderer *renderer, SDL_RenderCommand *cm
         render_data->clip_rect = *clip_rect;
     }
 
-    p = pb_begin();
     p = push_current_scissor(renderer, p);
-    pb_end(p);
-
-    return true;
-}
-
-static bool XBOX_RenderSetDrawColor(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
-{
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    const SDL_FColor *color = &cmd->data.color.color;
-    p = pb_begin();
-    p = xgux_set_color4f(p, color->r, color->g, color->b, color->a);
-    pb_end(p);
 
     return true;
 }
@@ -955,292 +971,300 @@ static bool XBOX_RenderClear(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
     int target_w, target_h;
     get_active_target_size(render_data, &target_w, &target_h);
 
-    p = pb_begin();
     p = push_scissor(p, 0, 0, target_w, target_h);
     p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, ((target_w - 1) << 16));
     p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, ((target_h - 1) << 16));
     p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, clear_color);
     p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
     p = push_current_scissor(renderer, p);
-    pb_end(p);
 
     return true;
 }
 
-static bool XBOX_RenderGeometry(SDL_Renderer *renderer, void *vertices, SDL_RenderCommand *cmd)
+static bool XBOX_RenderGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, uint32_t **block_start)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    const size_t count = cmd->data.draw.count;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    const int count = (int)cmd->data.draw.count;
+    if (count <= 0 || render_data->scissor_empty) {
+        return true;
+    }
 
     set_blend_mode(renderer, cmd->data.draw.blend);
 
+    const XguPrimitiveType prim = (cmd->data.draw.first & 1u) ? XGU_QUADS : XGU_TRIANGLES;
+    const uint32_t byte_offset = (uint32_t)(cmd->data.draw.first & ~1u);
+
     if (cmd->data.draw.texture) {
         xgu_texture_t *xgu_texture = (xgu_texture_t *)cmd->data.draw.texture->internal;
+        xgu_texture->last_used_epoch = render_data->gpu_epoch;
 
-        if (render_data->texture_shader_active == 0) {
-            p = pb_begin();
-            texture_combiner_apply();
-            pb_end(p);
-            render_data->texture_shader_active = 1;
-        }
+        set_texture_shader(render_data, 1);
 
-        // Nearest filtering is used for nearest and pixelart scale modes
         const XguTexFilter texture_filter =
             (cmd->data.draw.texture_scale_mode == SDL_SCALEMODE_LINEAR) ? XGU_TEXTURE_FILTER_LINEAR : XGU_TEXTURE_FILTER_NEAREST;
 
-        const XguTextureAddress texture_address_mode_u =
-            (cmd->data.draw.texture_address_mode_u == SDL_TEXTURE_ADDRESS_CLAMP) ? XGU_CLAMP_TO_EDGE : XGU_WRAP;
+        // NV2A only supports hardware wrapping on swizzled POT textures
+        const XguTextureAddress mode_u =
+            (!xgu_texture->swizzled || cmd->data.draw.texture_address_mode_u == SDL_TEXTURE_ADDRESS_CLAMP)
+                ? XGU_CLAMP_TO_EDGE
+                : XGU_WRAP;
+        const XguTextureAddress mode_v =
+            (!xgu_texture->swizzled || cmd->data.draw.texture_address_mode_v == SDL_TEXTURE_ADDRESS_CLAMP)
+                ? XGU_CLAMP_TO_EDGE
+                : XGU_WRAP;
 
-        const XguTextureAddress texture_address_mode_v =
-            (cmd->data.draw.texture_address_mode_v == SDL_TEXTURE_ADDRESS_CLAMP) ? XGU_CLAMP_TO_EDGE : XGU_WRAP;
-
-        const int texture_index = 0;
         if (render_data->active_texture != xgu_texture) {
-            p = pb_begin();
-            p = xgu_set_texture_offset(p, texture_index, xgu_texture->data_physical_address);
-            p = xgu_set_texture_format(p, texture_index, 2, false, XGU_SOURCE_COLOR, 2, xgu_texture->format, 1,
-                                       __builtin_ctz(xgu_texture->data_width), __builtin_ctz(xgu_texture->data_height), 0);
-            p = xgu_set_texture_control0(p, texture_index, true, 0, 0);
-            p = xgu_set_texture_control1(p, texture_index, xgu_texture->pitch);
-            p = xgu_set_texture_image_rect(p, texture_index, xgu_texture->tex_width, xgu_texture->tex_height);
-            pb_end(p);
+            const int size_u = xgu_texture->swizzled ? __builtin_ctz(xgu_texture->data_width) : 0;
+            const int size_v = xgu_texture->swizzled ? __builtin_ctz(xgu_texture->data_height) : 0;
+
+            p = xgu_set_texture_offset(p, 0, xgu_texture->data_physical_address);
+            p = xgu_set_texture_format(p, 0, 2, false, XGU_SOURCE_COLOR, 2, xgu_texture->format, 1, size_u, size_v, 0);
+            p = xgu_set_texture_control0(p, 0, true, 0, 0);
+            p = xgu_set_texture_control1(p, 0, xgu_texture->pitch);
+            p = xgu_set_texture_image_rect(p, 0, xgu_texture->tex_width, xgu_texture->tex_height);
             render_data->active_texture = xgu_texture;
-            // Invalidate these so they are refreshed
             xgu_texture->filter = -1;
             xgu_texture->mode_u = -1;
             xgu_texture->mode_v = -1;
         }
 
-        // The texture could be the same but the filter could have changed
-        if (render_data->active_texture->filter != texture_filter) {
-            p = pb_begin();
-            p = xgu_set_texture_filter(p, texture_index, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN,
+        if (xgu_texture->filter != texture_filter) {
+            p = xgu_set_texture_filter(p, 0, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN,
                                        texture_filter, texture_filter, false, false, false, false);
-            pb_end(p);
             xgu_texture->filter = texture_filter;
         }
 
-        // The texture could be the same but the address mode could have changed
-        if (render_data->active_texture->mode_u != texture_address_mode_u ||
-            render_data->active_texture->mode_v != texture_address_mode_v) {
-            p = pb_begin();
-            p = xgu_set_texture_address(p, texture_index,
-                                        texture_address_mode_u, (texture_address_mode_u == XGU_WRAP),
-                                        texture_address_mode_v, (texture_address_mode_v == XGU_WRAP),
-                                        XGU_CLAMP_TO_EDGE, false, false);
-            pb_end(p);
-            xgu_texture->mode_u = texture_address_mode_u;
-            xgu_texture->mode_v = texture_address_mode_v;
+        if (xgu_texture->mode_u != mode_u || xgu_texture->mode_v != mode_v) {
+            p = xgu_set_texture_address(p, 0, mode_u, false, mode_v, false, XGU_CLAMP_TO_EDGE, false, false);
+            xgu_texture->mode_u = mode_u;
+            xgu_texture->mode_v = mode_v;
         }
 
-        xgu_vertex_textured_t *xgu_verts = (xgu_vertex_textured_t *)vertices;
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
-                                SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_textured_t), xgu_verts->pos);
-        xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
-                                SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_textured_t), xgu_verts->color);
-        xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT,
-                                SDL_arraysize(xgu_verts->tex), sizeof(xgu_vertex_textured_t), xgu_verts->tex);
-        xgux_draw_arrays(XGU_TRIANGLES, 0, count);
+        int start = bind_vertex_stream(render_data, XGU_VERT_LAYOUT_TEXTURED, byte_offset, count, sizeof(xgu_vertex_textured_t));
+        p = xgu_emit_draw_arrays(p, block_start, prim, start, count);
     } else {
-
-        if (render_data->texture_shader_active == 1) {
-            p = pb_begin();
-            unlit_combiner_apply();
-            pb_end(p);
-            render_data->texture_shader_active = 0;
-        }
-
-        xgu_vertex_t *xgu_verts = (xgu_vertex_t *)vertices;
-        xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
-                                SDL_arraysize(xgu_verts->pos), sizeof(xgu_vertex_t), xgu_verts->pos);
-        xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_UNSIGNED_BYTE_OGL,
-                                SDL_arraysize(xgu_verts->color), sizeof(xgu_vertex_t), xgu_verts->color);
-        xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
-        xgux_draw_arrays(XGU_TRIANGLES, 0, count);
+        set_texture_shader(render_data, 0);
+        int start = bind_vertex_stream(render_data, XGU_VERT_LAYOUT_UNLIT, byte_offset, count, sizeof(xgu_vertex_t));
+        p = xgu_emit_draw_arrays(p, block_start, prim, start, count);
     }
 
     return true;
 }
 
-static bool XBOX_RenderPoints(SDL_Renderer *renderer, void *vertices, SDL_RenderCommand *cmd)
+static bool XBOX_RenderPrimitives(SDL_Renderer *renderer, SDL_RenderCommand *cmd, XguPrimitiveType mode, uint32_t **block_start)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    const size_t count = cmd->data.draw.count;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    const int count = (int)cmd->data.draw.count;
+    if (count < ((mode == XGU_LINE_STRIP) ? 2 : 1) || render_data->scissor_empty) {
+        return true;
+    }
 
     set_blend_mode(renderer, cmd->data.draw.blend);
+    set_texture_shader(render_data, 0);
 
-    xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
-    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
-                            SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
-    xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
-    xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
-    xgux_draw_arrays(XGU_POINTS, 0, count);
+    const uint32_t color32 = pack_color_rgba8888(&cmd->data.draw.color, cmd->data.draw.color_scale * 255.0f);
+    const int start = bind_vertex_stream(render_data, XGU_VERT_LAYOUT_POINT, (uint32_t)cmd->data.draw.first, count, sizeof(xgu_point_t));
 
-    return true;
-}
-
-static bool XBOX_RenderLines(SDL_Renderer *renderer, void *vertices, SDL_RenderCommand *cmd)
-{
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    const size_t count = cmd->data.draw.count;
-
-    set_blend_mode(renderer, cmd->data.draw.blend);
-
-    xgu_point_t *xgu_verts = (xgu_point_t *)vertices;
-    xgux_set_attrib_pointer(XGU_VERTEX_ARRAY, XGU_FLOAT,
-                            SDL_arraysize(xgu_verts->pos), sizeof(xgu_point_t), xgu_verts->pos);
-    xgux_set_attrib_pointer(XGU_COLOR_ARRAY, XGU_FLOAT, 0, 0, NULL);
-    xgux_set_attrib_pointer(XGU_TEXCOORD0_ARRAY, XGU_FLOAT, 0, 0, NULL);
-    xgux_draw_arrays(XGU_LINE_STRIP, 0, count);
+    p = pb_push1(p, NV097_SET_VERTEX_DATA4UB + XGU_COLOR_ARRAY * 4, color32);
+    p = xgu_emit_draw_arrays(p, block_start, mode, start, count);
 
     return true;
 }
 
 static void XBOX_InvalidateCachedState(SDL_Renderer *renderer)
 {
-    (void)renderer;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    render_data->active_texture = NULL;
+    render_data->active_vertex_layout = XGU_VERT_LAYOUT_UNKNOWN;
+    render_data->active_vertex_base = 0;
+    render_data->active_blend_mode = SDL_BLENDMODE_INVALID;
+    render_data->texture_shader_active = -1;
+    render_data->viewport_dirty = true;
 }
 
 static bool XBOX_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    (void)vertices;
     (void)vertsize;
+
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    if (render_data->active_render_target) {
+        render_data->active_render_target->last_used_epoch = render_data->gpu_epoch;
+    }
+
+    p = pb_begin();
+    uint32_t *block_start = p;
+
     while (cmd) {
+        if (p - block_start > SDL_XGU_KICK_DWORDS) {
+            pb_end(p);
+            p = pb_begin();
+            block_start = p;
+        }
+
         switch (cmd->command) {
         case SDL_RENDERCMD_SETVIEWPORT:
-        {
             XBOX_RenderSetViewPort(renderer, cmd);
             break;
-        }
         case SDL_RENDERCMD_SETCLIPRECT:
-        {
             XBOX_RenderSetClipRect(renderer, cmd);
             break;
-        }
-        case SDL_RENDERCMD_SETDRAWCOLOR:
-        {
-            XBOX_RenderSetDrawColor(renderer, cmd);
-            break;
-        }
         case SDL_RENDERCMD_CLEAR:
-        {
             XBOX_RenderClear(renderer, cmd);
             break;
-        }
         case SDL_RENDERCMD_DRAW_POINTS:
         {
-            XBOX_RenderPoints(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
+            SDL_RenderCommand *first_cmd = cmd;
+            while (cmd->next &&
+                   cmd->next->command == SDL_RENDERCMD_DRAW_POINTS &&
+                   cmd->next->data.draw.blend == first_cmd->data.draw.blend &&
+                   cmd->next->data.draw.color_scale == first_cmd->data.draw.color_scale &&
+                   fcolor_bits_equal(&cmd->next->data.draw.color, &first_cmd->data.draw.color) &&
+                   cmd->next->data.draw.first == first_cmd->data.draw.first + first_cmd->data.draw.count * sizeof(xgu_point_t)) {
+                first_cmd->data.draw.count += cmd->next->data.draw.count;
+                cmd = cmd->next;
+            }
+            XBOX_RenderPrimitives(renderer, first_cmd, XGU_POINTS, &block_start);
             break;
         }
         case SDL_RENDERCMD_DRAW_LINES:
-        {
-            XBOX_RenderLines(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
+            XBOX_RenderPrimitives(renderer, cmd, XGU_LINE_STRIP, &block_start);
             break;
-        }
         case SDL_RENDERCMD_GEOMETRY:
         {
-            XBOX_RenderGeometry(renderer, (uint8_t *)vertices + cmd->data.draw.first, cmd);
+            SDL_RenderCommand *first_cmd = cmd;
+            const size_t v_size = first_cmd->data.draw.texture ? sizeof(xgu_vertex_textured_t) : sizeof(xgu_vertex_t);
+            const size_t first_flag = first_cmd->data.draw.first & 1u;
+            const size_t first_offset = first_cmd->data.draw.first & ~1u;
+            while (cmd->next &&
+                   cmd->next->command == SDL_RENDERCMD_GEOMETRY &&
+                   (cmd->next->data.draw.first & 1u) == first_flag &&
+                   cmd->next->data.draw.texture == first_cmd->data.draw.texture &&
+                   cmd->next->data.draw.blend == first_cmd->data.draw.blend &&
+                   cmd->next->data.draw.texture_scale_mode == first_cmd->data.draw.texture_scale_mode &&
+                   cmd->next->data.draw.texture_address_mode_u == first_cmd->data.draw.texture_address_mode_u &&
+                   cmd->next->data.draw.texture_address_mode_v == first_cmd->data.draw.texture_address_mode_v &&
+                   (cmd->next->data.draw.first & ~1u) == first_offset + first_cmd->data.draw.count * v_size) {
+                first_cmd->data.draw.count += cmd->next->data.draw.count;
+                cmd = cmd->next;
+            }
+            XBOX_RenderGeometry(renderer, first_cmd, &block_start);
             break;
         }
-        // SDL should use XBOX_QueueGeometry instead of these commands.
-        case SDL_RENDERCMD_FILL_RECTS:
-        case SDL_RENDERCMD_COPY:
-        case SDL_RENDERCMD_COPY_EX:
-            break;
-        case SDL_RENDERCMD_NO_OP:
+        default:
             break;
         }
         cmd = cmd->next;
     }
 
+    pb_end(p);
     return true;
 }
 
 static SDL_Surface *XBOX_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    SDL_PixelFormat format = renderer->target ? renderer->target->format : SDL_PIXELFORMAT_ARGB8888;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    const xgu_texture_t *target = render_data->active_render_target;
 
-    SDL_Surface *surface = SDL_CreateSurface(rect->w, rect->h, format);
-    if (surface == NULL) {
-        return NULL;
-    }
-    const SDL_PixelFormat dst_format = surface->format;
-    const int dst_bytes_per_pixel = SDL_BYTESPERPIXEL(dst_format);
-    const int dst_pitch = surface->pitch;
-    uint8_t *dst8 = surface->pixels;
+    SDL_PixelFormat src_format;
+    int src_pitch;
+    int src_bpp;
+    const uint8_t *src8;
 
-    // Ensure the back buffer is fully renderered before reading pixels
     p = pb_begin();
     p = pb_push1(p, NV097_NO_OPERATION, 0);
     p = pb_push1(p, NV097_WAIT_FOR_IDLE, 0);
     pb_end(p);
 
-    while (pb_busy()) {
-        Sleep(0);
-    }
-
+    drain_gpu(render_data);
     XVideoFlushFB();
 
-    // Get the back buffer as the source
-    VIDEO_MODE vm = XVideoGetMode();
-    SDL_PixelFormat src_format;
-    if (vm.bpp == 15) {
-        src_format = SDL_PIXELFORMAT_XRGB1555;
-    } else if (vm.bpp == 16) {
-        src_format = SDL_PIXELFORMAT_RGB565;
+    if (target) {
+        src_format = renderer->target->format;
+        src_pitch = target->pitch;
+        src_bpp = target->bytes_per_pixel;
+        src8 = target->data;
     } else {
-        src_format = SDL_PIXELFORMAT_ARGB8888;
+        VIDEO_MODE vm = XVideoGetMode();
+        if (vm.bpp == 15) {
+            src_format = SDL_PIXELFORMAT_XRGB1555;
+        } else if (vm.bpp == 16) {
+            src_format = SDL_PIXELFORMAT_RGB565;
+        } else {
+            src_format = SDL_PIXELFORMAT_ARGB8888;
+        }
+        src_pitch = pb_back_buffer_pitch();
+        src_bpp = (vm.bpp + 7) / 8;
+        src8 = (const uint8_t *)pb_back_buffer();
     }
-    const int src_pitch = vm.width * ((vm.bpp + 7) / 8);
-    const uint8_t *src8 = (const uint8_t *)pb_back_buffer();
 
-    // Now copy the back buffer pixels to the surface
+    SDL_Surface *surface = SDL_CreateSurface(rect->w, rect->h, src_format);
+    if (surface == NULL) {
+        return NULL;
+    }
+
     SDL_ConvertPixels(rect->w, rect->h,
-                      src_format, &src8[rect->y * src_pitch + rect->x * dst_bytes_per_pixel], src_pitch,
-                      dst_format, &dst8[rect->y * dst_pitch + rect->x * dst_bytes_per_pixel], dst_pitch);
+                      src_format, &src8[rect->y * src_pitch + rect->x * src_bpp], src_pitch,
+                      surface->format, surface->pixels, surface->pitch);
 
     return surface;
 }
 
 static bool XBOX_RenderPresent(SDL_Renderer *renderer)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    extern unsigned int pb_ColorFmt;
 
-    calculate_fps(FPS_STAGE_DISPLAY);
-
+#if SDL_XGU_SHOW_FPS
     while (pb_busy()) {
-        Sleep(0);
     }
-
-    while (pb_finished()) {
-        Sleep(0);
-    }
-
     calculate_fps(FPS_STAGE_CALCULATE);
+    calculate_fps(FPS_STAGE_DISPLAY);
+#endif
 
-    // It's probably better to wait on the vsync primitive here than it is to spin on pb_finished next loop
-    pb_wait_for_vbl();
+    // Wait while all 3 pbkit back buffers are queued, and ensure scanout of the new back buffer has finished
+    while (pb_finished()) {
+        pb_wait_for_vbl();
+    }
+    const uint32_t back_buffer = (uint32_t)pb_back_buffer() & 0x03FFFFFF;
+    while ((VIDEOREG(SDL_XGU_PCRTC_START) & 0x03FFFFFF) == back_buffer) {
+        pb_wait_for_vbl();
+    }
 
-    // A back buffer frame is rendered so clear the vertex allocation tracking for that frame.
-    render_data->frame_index = (render_data->frame_index + 1) % SDL_XGU_BUFFER_COUNT;
-    render_data->vertex_allocations[render_data->frame_index] = 0;
-
-    // Reset for the next frame
-    calculate_fps(FPS_STAGE_RESET);
     pb_reset();
-    pb_erase_depth_stencil_buffer(0, 0, pb_back_buffer_width(), pb_back_buffer_height());
+
+    // pb_reset() drains PGRAPH and resets surface registers to the back buffer.
+    // Reset active_vertex_base so the next frame re-pushes vertex array offsets and
+    // invalidates the NV2A post-T&L vertex cache when reusing vertex indices from 0.
+    render_data->gpu_epoch++;
+    render_data->vertex_arena_offset = 0;
+    render_data->active_vertex_base = 0;
+    render_data->active_render_target = NULL;
+    render_data->active_surface_format = pb_ColorFmt;
+
+#if SDL_XGU_SHOW_FPS
+    p = pb_begin();
+    p = push_current_scissor(renderer, p);
+    pb_end(p);
+#endif
+
+    calculate_fps(FPS_STAGE_RESET);
     return true;
 }
 
 static void XBOX_DestroyRenderer(SDL_Renderer *renderer)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    pb_kill();
-
-    SDL_free(render_data);
-    MmFreeContiguousMemory(render_data->vertex_data);
-
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    if (render_data) {
+        while (pb_busy()) {
+            Sleep(0);
+        }
+        pb_kill();
+        if (render_data->vertex_data) {
+            MmFreeContiguousMemory(render_data->vertex_data);
+        }
+        SDL_free(render_data);
+    }
     renderer->internal = NULL;
     renderer->vertex_data = NULL;
 }
@@ -1248,19 +1272,32 @@ static void XBOX_DestroyRenderer(SDL_Renderer *renderer)
 static bool XBOX_SetVSync(SDL_Renderer *renderer, const int vsync)
 {
     (void)renderer;
-    (void)vsync;
-
-    // pbkit always flips on vblank and it can't easily be disabled.
+    if (vsync == 0 || vsync == 1) {
+        return true;
+    }
     return SDL_Unsupported();
 }
 
 static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_PropertiesID create_props)
 {
     (void)create_props;
+    extern unsigned int pb_ColorFmt;
+
     xgu_render_data_t *render_data = (xgu_render_data_t *)SDL_calloc(1, sizeof(xgu_render_data_t));
     if (render_data == NULL) {
         return SDL_OutOfMemory();
     }
+
+    render_data->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
+                                                            PAGE_WRITECOMBINE | PAGE_READWRITE);
+    if (render_data->vertex_data == NULL) {
+        SDL_free(render_data);
+        return SDL_SetError("Failed to allocate XGU arena");
+    }
+
+    render_data->vertex_data_physical = (uint32_t)MmGetPhysicalAddress(render_data->vertex_data);
+    renderer->vertex_data = render_data->vertex_data;
+    renderer->internal = render_data;
 
     const float m_identity[4 * 4] = {
         1.0f, 0.0f, 0.0f, 0.0f,
@@ -1269,38 +1306,38 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
         0.0f, 0.0f, 0.0f, 1.0f
     };
 
-    // Change the framebuffer surface format based on the video mode
     const VIDEO_MODE vm = XVideoGetMode();
-    pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
+    if (vm.bpp == 16) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
+    } else if (vm.bpp == 15) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
+    } else {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
+    }
 
     while (pb_init() < 0) {
         DbgPrint("[nxdk renderer] pbkit initialization failed, retrying...\n");
         Sleep(10);
     }
 
-    // pbkit can disable video output in some cases, re-enable it
     XVideoSetVideoEnable(true);
-
     pb_show_front_screen();
     pb_target_back_buffer();
 
+    render_data->texture_shader_active = -1;
+
     p = pb_begin();
     combiner_init();
-    unlit_combiner_apply();
-
-    p = xgu_set_blend_enable(p, true);
+    set_texture_shader(render_data, 0);
+    p = xgu_set_blend_enable(p, false);
     p = xgu_set_depth_test_enable(p, false);
-    p = xgu_set_blend_func_sfactor(p, XGU_FACTOR_SRC_ALPHA);
-    p = xgu_set_blend_func_dfactor(p, XGU_FACTOR_ONE_MINUS_SRC_ALPHA);
     p = xgu_set_depth_func(p, XGU_FUNC_LESS_OR_EQUAL);
-
     p = xgu_set_skin_mode(p, XGU_SKIN_MODE_OFF);
     p = xgu_set_normalization_enable(p, false);
     p = xgu_set_lighting_enable(p, false);
     p = xgu_set_cull_face_enable(p, false);
     p = xgu_set_clear_rect_vertical(p, 0, pb_back_buffer_height());
     p = xgu_set_clear_rect_horizontal(p, 0, pb_back_buffer_width());
-
     pb_end(p);
 
     for (int i = 0; i < XGU_TEXTURE_COUNT; i++) {
@@ -1321,11 +1358,11 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
         pb_end(p);
     }
 
-    for (int i = 0; i < XGU_ATTRIBUTE_COUNT; i++) {
-        xgux_set_attrib_pointer(i, XGU_FLOAT, 0, 0, NULL);
-    }
-
     p = pb_begin();
+    for (int i = 0; i < XGU_ATTRIBUTE_COUNT; i++) {
+        p = xgu_set_vertex_data_array_format(p, i, XGU_FLOAT, 0, 0);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + i * 4, 0);
+    }
     p = xgu_set_transform_execution_mode(p, XGU_FIXED, XGU_RANGE_MODE_PRIVATE);
     p = xgu_set_projection_matrix(p, m_identity);
     p = xgu_set_composite_matrix(p, m_identity);
@@ -1356,40 +1393,33 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     renderer->DestroyRenderer = XBOX_DestroyRenderer;
     renderer->RenderReadPixels = XBOX_RenderReadPixels;
     renderer->SetVSync = XBOX_SetVSync;
-    renderer->internal = render_data;
     renderer->window = window;
     renderer->name = "nxdk_xgu";
-
-    // Texture wrapping is only supported by swizzled POT textures.
     renderer->npot_texture_wrap_unsupported = true;
 
-    arena_init(renderer);
-
-    // Initialize the default clip rect and viewport
-    render_data->viewport = (SDL_Rect){ 0, 0, pb_back_buffer_width(), pb_back_buffer_height() };
+    render_data->viewport = (SDL_Rect){ 0, 0, (int)pb_back_buffer_width(), (int)pb_back_buffer_height() };
     render_data->clip_rect = render_data->viewport;
+    render_data->active_blend_mode = SDL_BLENDMODE_NONE;
+    render_data->active_surface_format = pb_ColorFmt;
+    render_data->gpu_epoch = 1;
 
-    // Point the frame index to what would be the older frame which is the one just after the one we are rendering.
-    render_data->frame_index = 1;
-
-    // These are supported texture formats, however not all of them are supported as render targets.
-    // There appears to be no way to differentiate this. CreateTexture will fail if the format is not supported as a render target.
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGB565);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_XRGB8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBA8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR8888);
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_BGRA8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB4444);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB1555);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_XRGB1555);
     SDL_SetNumberProperty(SDL_GetRendererProperties(renderer), SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 4096);
 
-    // This hint makes SDL use the driver line API.
     SDL_SetHint(SDL_HINT_RENDER_LINE_METHOD, "2");
 
     while (pb_busy()) {
         Sleep(0);
     }
     pb_reset();
+    calculate_fps(FPS_STAGE_RESET);
 
     return true;
 }
