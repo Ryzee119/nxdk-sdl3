@@ -91,18 +91,6 @@ typedef struct xgu_render_data
     struct s_CtxDma render_target_dma_ctx;
 } xgu_render_data_t;
 
-// Forward declarations
-static inline void combiner_init(void);
-static inline void texture_combiner_apply(void);
-static inline void unlit_combiner_apply(void);
-static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode);
-static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect);
-static void set_surface_color_format(const int bpp);
-static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset);
-static bool arena_init(SDL_Renderer *renderer);
-static bool sdl_to_xgu_texture_format(SDL_PixelFormat sdl_format, int *xgu_texture_format, int *bytes_per_pixel, bool swizzled);
-static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel);
-static inline uint32_t npot2pot(uint32_t num);
 
 enum fps_stage
 {
@@ -110,10 +98,366 @@ enum fps_stage
     FPS_STAGE_CALCULATE,
     FPS_STAGE_DISPLAY,
 };
-static void calculate_fps(enum fps_stage stage);
-
 // pushbuffer pointer
 static uint32_t *p = NULL;
+
+static inline uint32_t npot2pot(uint32_t num)
+{
+    uint32_t msb;
+    __asm__("bsr %1, %0" : "=r"(msb) : "r"(num));
+
+    if ((1 << msb) == num) {
+        return num;
+    }
+
+    return 1 << (msb + 1);
+}
+
+static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel)
+{
+    switch (sdl_format) {
+    case SDL_PIXELFORMAT_RGB565:
+        *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5;
+        *bytes_per_pixel = 2;
+        return true;
+    case SDL_PIXELFORMAT_XRGB8888:
+    case SDL_PIXELFORMAT_ARGB8888:
+        *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8;
+        *bytes_per_pixel = 4;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, int *xgu_format, int *bytes_per_pixel, bool swizzled)
+{
+    switch (fmt) {
+    case SDL_PIXELFORMAT_ARGB1555:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_A1R5G5B5;
+        *bytes_per_pixel = 2;
+        return true;
+    case SDL_PIXELFORMAT_RGB565:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R5G6B5_SWIZZLED : XGU_TEXTURE_FORMAT_R5G6B5;
+        *bytes_per_pixel = 2;
+        return true;
+    case SDL_PIXELFORMAT_ARGB8888:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_A8R8G8B8;
+        *bytes_per_pixel = 4;
+        return true;
+    case SDL_PIXELFORMAT_XRGB8888:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_X8R8G8B8;
+        *bytes_per_pixel = 4;
+        return true;
+    case SDL_PIXELFORMAT_RGBA8888:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R8G8B8A8_SWIZZLED : XGU_TEXTURE_FORMAT_R8G8B8A8;
+        *bytes_per_pixel = 4;
+        return true;
+    case SDL_PIXELFORMAT_ABGR8888:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8B8G8R8_SWIZZLED : XGU_TEXTURE_FORMAT_A8B8G8R8;
+        *bytes_per_pixel = 4;
+        return true;
+    case SDL_PIXELFORMAT_ARGB4444:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A4R4G4B4_SWIZZLED : XGU_TEXTURE_FORMAT_A4R4G4B4;
+        *bytes_per_pixel = 2;
+        return true;
+    case SDL_PIXELFORMAT_XRGB1555:
+        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_X1R5G5B5;
+        *bytes_per_pixel = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool arena_init(SDL_Renderer *renderer)
+{
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    render_data->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
+                                                            PAGE_WRITECOMBINE | PAGE_READWRITE);
+    if (render_data->vertex_data == NULL) {
+        SDL_SetError("Failed to allocate XGU arena");
+        return false;
+    }
+
+    renderer->vertex_data = render_data->vertex_data;
+    render_data->vertex_arena_offset = 0;
+
+    return true;
+}
+
+static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset)
+{
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    int total_allocated = 0;
+
+    // Ensure alignment. If every allocation is aligned, we know every pointer will be aligned.
+    size = (size + SDL_XGU_VERTEX_ALIGNMENT - 1) & ~(SDL_XGU_VERTEX_ALIGNMENT - 1);
+
+    if (render_data->vertex_arena_offset + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
+        // We lost some space to end padding, so ensure we tag that on when we validate our allocation size
+        total_allocated += render_data->vertex_arena_offset + size - SDL_XGU_VERTEX_BUFFER_SIZE;
+
+        // Round robin back to the start of the arena
+        render_data->vertex_arena_offset = 0;
+    }
+
+    // Area we going to overflow the vertex buffer?
+    for (int i = 0; i < SDL_XGU_BUFFER_COUNT; i++) {
+        total_allocated += render_data->vertex_allocations[i];
+    }
+    if (total_allocated + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
+        SDL_Log("Vertex buffer overflow. Increase SDL_XGU_VERTEX_BUFFER_SIZE", size);
+        return NULL;
+    }
+
+    void *ptr = (void *)((intptr_t)render_data->vertex_data + render_data->vertex_arena_offset);
+    assert(((intptr_t)ptr & (SDL_XGU_VERTEX_ALIGNMENT - 1)) == 0);
+
+    *vertex_data_offset = render_data->vertex_arena_offset;
+    render_data->vertex_arena_offset += size;
+    render_data->vertex_allocations[render_data->frame_index] += size;
+    return ptr;
+}
+
+static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
+{
+    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+
+    if (blendMode == render_data->active_blend_mode) {
+        return;
+    }
+
+    XguBlendFactor sfactor;
+    XguBlendFactor dfactor;
+
+    switch (blendMode) {
+    case SDL_BLENDMODE_NONE:
+        sfactor = XGU_FACTOR_ONE;
+        dfactor = XGU_FACTOR_ZERO;
+        break;
+    case SDL_BLENDMODE_BLEND:
+        sfactor = XGU_FACTOR_SRC_ALPHA;
+        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
+        break;
+    case SDL_BLENDMODE_BLEND_PREMULTIPLIED:
+        sfactor = XGU_FACTOR_ONE;
+        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
+        break;
+    case SDL_BLENDMODE_ADD:
+        sfactor = XGU_FACTOR_SRC_ALPHA;
+        dfactor = XGU_FACTOR_ONE;
+        break;
+    case SDL_BLENDMODE_ADD_PREMULTIPLIED:
+        sfactor = XGU_FACTOR_ONE;
+        dfactor = XGU_FACTOR_ONE;
+        break;
+    case SDL_BLENDMODE_MUL:
+        sfactor = XGU_FACTOR_DST_COLOR;
+        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
+        break;
+    case SDL_BLENDMODE_MOD:
+        sfactor = XGU_FACTOR_ZERO;
+        dfactor = XGU_FACTOR_SRC_COLOR;
+        break;
+    default:
+        SDL_Log("Unsupported blend mode %d, defaulting to SDL_BLENDMODE_BLEND", blendMode);
+        sfactor = XGU_FACTOR_SRC_ALPHA;
+        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
+    }
+
+    p = pb_begin();
+    p = xgu_set_blend_func_sfactor(p, sfactor);
+    p = xgu_set_blend_func_dfactor(p, dfactor);
+    p = push_command_parameter(p, NV097_SET_BLEND_EQUATION, NV097_SET_BLEND_EQUATION_V_FUNC_ADD);
+    pb_end(p);
+
+    render_data->active_blend_mode = blendMode;
+}
+
+static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect)
+{
+    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    SDL_Rect scissor_rect = {
+        .x = rect->x,
+        .y = rect->y,
+        .w = rect->w,
+        .h = rect->h
+    };
+
+    scissor_rect.w = SDL_max(scissor_rect.w, 0);
+    scissor_rect.h = SDL_max(scissor_rect.h, 0);
+
+    if (render_data->active_render_target) {
+        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, render_data->active_render_target->tex_width);
+        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, render_data->active_render_target->tex_height);
+        scissor_rect.w = SDL_min(scissor_rect.w, render_data->active_render_target->tex_width - scissor_rect.x);
+        scissor_rect.h = SDL_min(scissor_rect.h, render_data->active_render_target->tex_height - scissor_rect.y);
+    } else {
+        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, (int)pb_back_buffer_width());
+        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, (int)pb_back_buffer_height());
+        scissor_rect.w = SDL_min(scissor_rect.w, (int)pb_back_buffer_width() - scissor_rect.x);
+        scissor_rect.h = SDL_min(scissor_rect.h, (int)pb_back_buffer_height() - scissor_rect.y);
+    }
+
+    return scissor_rect;
+}
+
+static void set_surface_color_format(const int bpp)
+{
+    if (bpp == 16) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
+    } else if (bpp == 15) {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
+    } else {
+        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
+    }
+}
+
+// clang-format off
+static inline void combiner_init(void)
+{
+   pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT,
+    XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE1, 0)
+    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE2, 0)
+    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE3, 0));
+    p += 2;
+    pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
+        XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_PROGRAM_NONE)
+        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE1, NV097_SET_SHADER_STAGE_PROGRAM_STAGE1_PROGRAM_NONE)
+        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE2, NV097_SET_SHADER_STAGE_PROGRAM_STAGE2_PROGRAM_NONE)
+        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE3, NV097_SET_SHADER_STAGE_PROGRAM_STAGE3_PROGRAM_NONE));
+    p += 2;
+
+    pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
+    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 0 * 4,
+        XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, 0x4)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DST, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_SUM_DST, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_MUX_ENABLE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DOT_ENABLE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DOT_ENABLE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_NOSHIFT));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
+        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + 0 * 4,
+        XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, 0x4)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_CD_DST, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_SUM_DST, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_MUX_ENABLE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_OP, NV097_SET_COMBINER_ALPHA_OCW_OP_NOSHIFT));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_CONTROL,
+        XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR0, NV097_SET_COMBINER_CONTROL_FACTOR0_SAME_FACTOR_ALL)
+        | XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR1, NV097_SET_COMBINER_CONTROL_FACTOR1_SAME_FACTOR_ALL)
+        | XGU_MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 1));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0,
+        XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_INVERSE, 0));
+    p += 2;
+    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
+        XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_INVERSE, 0)
+        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_SPECULAR_CLAMP, 0));
+    p += 2;
+}
+
+static inline void unlit_combiner_apply (void)
+{
+    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
+    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);
+
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
+    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
+
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
+        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
+}
+
+static inline void texture_combiner_apply (void)
+{
+    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
+    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE));
+
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
+    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x6)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
+    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
+  
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
+        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x6)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
+        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
+}
+// clang-format on
+
+#if SDL_XGU_SHOW_FPS
+static uint64_t frame_start;
+static uint64_t frame_time = 0;
+static int frame_time_index = 0;
+static float fps = 0.0f;
+
+// This calculation is a bit more complex than usual but because pbkit forces a vblank flip
+// we will often just get a capped FPS. This calculates the average frame rendering time without the
+// vblank wait and then calculate the maximum 'theoretical FPS' based on that.
+// This is not perfect but it gives a better idea of the actual rendering performance.
+static void calculate_fps(enum fps_stage stage)
+{
+    // Stage 0 initializes the frame start time
+    if (stage == 0) {
+        frame_start = SDL_GetTicksNS();
+        return;
+    }
+    // Stage 1 calculates the average frame time and FPS
+    else if (stage == 1) {
+        const int average_frame_count = 60;
+        frame_time += (SDL_GetTicksNS() - frame_start);
+        if (frame_time_index++ == average_frame_count - 1) {
+            fps = 1e9f * (float)average_frame_count / (float)frame_time;
+            frame_time_index = 0;
+            frame_time = 0.0f;
+        }
+        return;
+    }
+    // Stage 2 displays the FPS on the screen
+    else if (stage == 2) {
+        char pb_text[16];
+        pb_erase_text_screen();
+        int len = SDL_snprintf(pb_text, sizeof(pb_text), "FPS: %.02f", fps);
+        pb_fill(20, 25, len * 10, 20, 0xFF000000);
+        pb_print(pb_text);
+        pb_draw_text_screen();
+        return;
+    }
+}
+#else
+static void calculate_fps(enum fps_stage stage)
+{
+    (void)stage;
+}
+#endif
 
 static void XBOX_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *event)
 {
@@ -986,363 +1330,5 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
 SDL_RenderDriver nxdk_RenderDriver = {
     XBOX_CreateRenderer, "nxdk_xgu"
 };
-
-static inline uint32_t npot2pot(uint32_t num)
-{
-    uint32_t msb;
-    __asm__("bsr %1, %0" : "=r"(msb) : "r"(num));
-
-    if ((1 << msb) == num) {
-        return num;
-    }
-
-    return 1 << (msb + 1);
-}
-
-static bool sdl_to_xgu_surface_format(SDL_PixelFormat sdl_format, int *xgu_surface_format, int *bytes_per_pixel)
-{
-    switch (sdl_format) {
-    case SDL_PIXELFORMAT_RGB565:
-        *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5;
-        *bytes_per_pixel = 2;
-        return true;
-    case SDL_PIXELFORMAT_XRGB8888:
-    case SDL_PIXELFORMAT_ARGB8888:
-        *xgu_surface_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8;
-        *bytes_per_pixel = 4;
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool sdl_to_xgu_texture_format(SDL_PixelFormat fmt, int *xgu_format, int *bytes_per_pixel, bool swizzled)
-{
-    switch (fmt) {
-    case SDL_PIXELFORMAT_ARGB1555:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_A1R5G5B5;
-        *bytes_per_pixel = 2;
-        return true;
-    case SDL_PIXELFORMAT_RGB565:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R5G6B5_SWIZZLED : XGU_TEXTURE_FORMAT_R5G6B5;
-        *bytes_per_pixel = 2;
-        return true;
-    case SDL_PIXELFORMAT_ARGB8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_A8R8G8B8;
-        *bytes_per_pixel = 4;
-        return true;
-    case SDL_PIXELFORMAT_XRGB8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X8R8G8B8_SWIZZLED : XGU_TEXTURE_FORMAT_X8R8G8B8;
-        *bytes_per_pixel = 4;
-        return true;
-    case SDL_PIXELFORMAT_RGBA8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_R8G8B8A8_SWIZZLED : XGU_TEXTURE_FORMAT_R8G8B8A8;
-        *bytes_per_pixel = 4;
-        return true;
-    case SDL_PIXELFORMAT_ABGR8888:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A8B8G8R8_SWIZZLED : XGU_TEXTURE_FORMAT_A8B8G8R8;
-        *bytes_per_pixel = 4;
-        return true;
-    case SDL_PIXELFORMAT_ARGB4444:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_A4R4G4B4_SWIZZLED : XGU_TEXTURE_FORMAT_A4R4G4B4;
-        *bytes_per_pixel = 2;
-        return true;
-    case SDL_PIXELFORMAT_XRGB1555:
-        *xgu_format = (swizzled) ? XGU_TEXTURE_FORMAT_X1R5G5B5_SWIZZLED : XGU_TEXTURE_FORMAT_X1R5G5B5;
-        *bytes_per_pixel = 2;
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool arena_init(SDL_Renderer *renderer)
-{
-    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    render_data->vertex_data = MmAllocateContiguousMemoryEx(SDL_XGU_VERTEX_BUFFER_SIZE, 0, 0xFFFFFFFF, 0,
-                                                            PAGE_WRITECOMBINE | PAGE_READWRITE);
-    if (render_data->vertex_data == NULL) {
-        SDL_SetError("Failed to allocate XGU arena");
-        return false;
-    }
-
-    renderer->vertex_data = render_data->vertex_data;
-    render_data->vertex_arena_offset = 0;
-
-    return true;
-}
-
-static void *arena_allocate(SDL_Renderer *renderer, size_t size, size_t *vertex_data_offset)
-{
-    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    int total_allocated = 0;
-
-    // Ensure alignment. If every allocation is aligned, we know every pointer will be aligned.
-    size = (size + SDL_XGU_VERTEX_ALIGNMENT - 1) & ~(SDL_XGU_VERTEX_ALIGNMENT - 1);
-
-    if (render_data->vertex_arena_offset + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
-        // We lost some space to end padding, so ensure we tag that on when we validate our allocation size
-        total_allocated += render_data->vertex_arena_offset + size - SDL_XGU_VERTEX_BUFFER_SIZE;
-
-        // Round robin back to the start of the arena
-        render_data->vertex_arena_offset = 0;
-    }
-
-    // Area we going to overflow the vertex buffer?
-    for (int i = 0; i < SDL_XGU_BUFFER_COUNT; i++) {
-        total_allocated += render_data->vertex_allocations[i];
-    }
-    if (total_allocated + size > SDL_XGU_VERTEX_BUFFER_SIZE) {
-        SDL_Log("Vertex buffer overflow. Increase SDL_XGU_VERTEX_BUFFER_SIZE", size);
-        return NULL;
-    }
-
-    void *ptr = (void *)((intptr_t)render_data->vertex_data + render_data->vertex_arena_offset);
-    assert(((intptr_t)ptr & (SDL_XGU_VERTEX_ALIGNMENT - 1)) == 0);
-
-    *vertex_data_offset = render_data->vertex_arena_offset;
-    render_data->vertex_arena_offset += size;
-    render_data->vertex_allocations[render_data->frame_index] += size;
-    return ptr;
-}
-
-static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
-{
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-
-    if (blendMode == render_data->active_blend_mode) {
-        return;
-    }
-
-    XguBlendFactor sfactor;
-    XguBlendFactor dfactor;
-
-    switch (blendMode) {
-    case SDL_BLENDMODE_NONE:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ZERO;
-        break;
-    case SDL_BLENDMODE_BLEND:
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_BLEND_PREMULTIPLIED:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_ADD:
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE;
-        break;
-    case SDL_BLENDMODE_ADD_PREMULTIPLIED:
-        sfactor = XGU_FACTOR_ONE;
-        dfactor = XGU_FACTOR_ONE;
-        break;
-    case SDL_BLENDMODE_MUL:
-        sfactor = XGU_FACTOR_DST_COLOR;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-        break;
-    case SDL_BLENDMODE_MOD:
-        sfactor = XGU_FACTOR_ZERO;
-        dfactor = XGU_FACTOR_SRC_COLOR;
-        break;
-    default:
-        SDL_Log("Unsupported blend mode %d, defaulting to SDL_BLENDMODE_BLEND", blendMode);
-        sfactor = XGU_FACTOR_SRC_ALPHA;
-        dfactor = XGU_FACTOR_ONE_MINUS_SRC_ALPHA;
-    }
-
-    p = pb_begin();
-    p = xgu_set_blend_func_sfactor(p, sfactor);
-    p = xgu_set_blend_func_dfactor(p, dfactor);
-    p = push_command_parameter(p, NV097_SET_BLEND_EQUATION, NV097_SET_BLEND_EQUATION_V_FUNC_ADD);
-    pb_end(p);
-
-    render_data->active_blend_mode = blendMode;
-}
-
-static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect)
-{
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    SDL_Rect scissor_rect = {
-        .x = rect->x,
-        .y = rect->y,
-        .w = rect->w,
-        .h = rect->h
-    };
-
-    scissor_rect.w = SDL_max(scissor_rect.w, 0);
-    scissor_rect.h = SDL_max(scissor_rect.h, 0);
-
-    if (render_data->active_render_target) {
-        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, render_data->active_render_target->tex_width);
-        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, render_data->active_render_target->tex_height);
-        scissor_rect.w = SDL_min(scissor_rect.w, render_data->active_render_target->tex_width - scissor_rect.x);
-        scissor_rect.h = SDL_min(scissor_rect.h, render_data->active_render_target->tex_height - scissor_rect.y);
-    } else {
-        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, (int)pb_back_buffer_width());
-        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, (int)pb_back_buffer_height());
-        scissor_rect.w = SDL_min(scissor_rect.w, (int)pb_back_buffer_width() - scissor_rect.x);
-        scissor_rect.h = SDL_min(scissor_rect.h, (int)pb_back_buffer_height() - scissor_rect.y);
-    }
-
-    return scissor_rect;
-}
-
-static void set_surface_color_format(const int bpp)
-{
-    if (bpp == 16) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
-    } else if (bpp == 15) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
-    } else {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
-    }
-}
-
-// clang-format off
-static inline void combiner_init(void)
-{
-   pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT,
-    XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE1, 0)
-    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE2, 0)
-    | XGU_MASK(NV097_SET_SHADER_OTHER_STAGE_INPUT_STAGE3, 0));
-    p += 2;
-    pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
-        XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE1, NV097_SET_SHADER_STAGE_PROGRAM_STAGE1_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE2, NV097_SET_SHADER_STAGE_PROGRAM_STAGE2_PROGRAM_NONE)
-        | XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE3, NV097_SET_SHADER_STAGE_PROGRAM_STAGE3_PROGRAM_NONE));
-    p += 2;
-
-    pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, 0x4)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DST, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_SUM_DST, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_MUX_ENABLE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DOT_ENABLE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_CD_DOT_ENABLE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_NOSHIFT));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, 0x4)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_CD_DST, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_SUM_DST, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_MUX_ENABLE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_OCW_OP, NV097_SET_COMBINER_ALPHA_OCW_OP_NOSHIFT));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_CONTROL,
-        XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR0, NV097_SET_COMBINER_CONTROL_FACTOR0_SAME_FACTOR_ALL)
-        | XGU_MASK(NV097_SET_COMBINER_CONTROL_FACTOR1, NV097_SET_COMBINER_CONTROL_FACTOR1_SAME_FACTOR_ALL)
-        | XGU_MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 1));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0,
-        XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_A_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_B_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_C_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_INVERSE, 0));
-    p += 2;
-    pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
-        XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_E_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_F_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_INVERSE, 0)
-        | XGU_MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_SPECULAR_CLAMP, 0));
-    p += 2;
-}
-
-static inline void unlit_combiner_apply (void)
-{
-    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
-    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);
-
-    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x1)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
-
-    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x1)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
-}
-
-static inline void texture_combiner_apply (void)
-{
-    p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
-    p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, XGU_MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE));
-
-    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 0 * 4,
-    XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, 0x6)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_C_MAP, 0x0)
-    | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_ALPHA, 0) | XGU_MASK(NV097_SET_COMBINER_COLOR_ICW_D_MAP, 0x0));
-  
-    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 0 * 4,
-        XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, 0x8) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, 0x4) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, 0x6)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, 0x0)
-        | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, 0x0) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | XGU_MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, 0x0));
-}
-// clang-format on
-
-#if SDL_XGU_SHOW_FPS
-static uint64_t frame_start;
-static uint64_t frame_time = 0;
-static int frame_time_index = 0;
-static float fps = 0.0f;
-
-// This calculation is a bit more complex than usual but because pbkit forces a vblank flip
-// we will often just get a capped FPS. This calculates the average frame rendering time without the
-// vblank wait and then calculate the maximum 'theoretical FPS' based on that.
-// This is not perfect but it gives a better idea of the actual rendering performance.
-static void calculate_fps(enum fps_stage stage)
-{
-    // Stage 0 initializes the frame start time
-    if (stage == 0) {
-        frame_start = SDL_GetTicksNS();
-        return;
-    }
-    // Stage 1 calculates the average frame time and FPS
-    else if (stage == 1) {
-        const int average_frame_count = 60;
-        frame_time += (SDL_GetTicksNS() - frame_start);
-        if (frame_time_index++ == average_frame_count - 1) {
-            fps = 1e9f * (float)average_frame_count / (float)frame_time;
-            frame_time_index = 0;
-            frame_time = 0.0f;
-        }
-        return;
-    }
-    // Stage 2 displays the FPS on the screen
-    else if (stage == 2) {
-        char pb_text[16];
-        pb_erase_text_screen();
-        int len = SDL_snprintf(pb_text, sizeof(pb_text), "FPS: %.02f", fps);
-        pb_fill(20, 25, len * 10, 20, 0xFF000000);
-        pb_print(pb_text);
-        pb_draw_text_screen();
-        return;
-    }
-}
-#else
-static void calculate_fps(enum fps_stage stage)
-{
-    (void)stage;
-}
-#endif
 
 #endif // SDL_VIDEO_RENDER_XGU
