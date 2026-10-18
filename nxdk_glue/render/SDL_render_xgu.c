@@ -80,9 +80,13 @@ typedef struct xgu_render_data
 {
     int texture_shader_active;
     const xgu_texture_t *active_texture;
-    const xgu_texture_t *active_render_target;
+    xgu_texture_t *active_render_target;
+    uint32_t active_surface_format;
     SDL_Rect viewport;
     SDL_Rect clip_rect;
+    bool viewport_dirty;
+    bool clip_rect_enabled;
+    bool scissor_empty;
     SDL_BlendMode active_blend_mode;
     void *vertex_data;
     int vertex_arena_offset;
@@ -100,6 +104,55 @@ enum fps_stage
 };
 // pushbuffer pointer
 static uint32_t *p = NULL;
+
+static inline void get_active_target_size(const xgu_render_data_t *render_data, int *w, int *h)
+{
+    if (render_data->active_render_target) {
+        *w = render_data->active_render_target->tex_width;
+        *h = render_data->active_render_target->tex_height;
+    } else {
+        *w = (int)pb_back_buffer_width();
+        *h = (int)pb_back_buffer_height();
+    }
+}
+
+// NV2A window clip max is inclusive (xgu_set_scissor_rect treats it as exclusive). w/h must be > 0.
+static inline uint32_t *push_scissor(uint32_t *pb, int x, int y, int w, int h)
+{
+    pb = push_command_boolean(pb, NV097_SET_WINDOW_CLIP_TYPE, false);
+    pb = push_command_parameter(pb, NV097_SET_WINDOW_CLIP_HORIZONTAL, ((uint32_t)(x + w - 1) << 16) | (uint32_t)x);
+    pb = push_command_parameter(pb, NV097_SET_WINDOW_CLIP_VERTICAL, ((uint32_t)(y + h - 1) << 16) | (uint32_t)y);
+    return pb;
+}
+
+static inline uint32_t *push_current_scissor(SDL_Renderer *renderer, uint32_t *pb)
+{
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    SDL_Rect rect = render_data->viewport;
+
+    if (render_data->clip_rect_enabled) {
+        SDL_Rect abs_clip = render_data->clip_rect;
+        abs_clip.x += render_data->viewport.x;
+        abs_clip.y += render_data->viewport.y;
+        if (!SDL_GetRectIntersection(&abs_clip, &render_data->viewport, &rect)) {
+            rect = (SDL_Rect){ 0, 0, 0, 0 };
+        }
+    }
+
+    int target_w, target_h;
+    get_active_target_size(render_data, &target_w, &target_h);
+    rect.x = SDL_clamp(rect.x, 0, target_w);
+    rect.y = SDL_clamp(rect.y, 0, target_h);
+    rect.w = SDL_clamp(rect.w, 0, target_w - rect.x);
+    rect.h = SDL_clamp(rect.h, 0, target_h - rect.y);
+
+    // The hardware cannot express an empty clip region; draws are skipped instead.
+    render_data->scissor_empty = (rect.w <= 0 || rect.h <= 0);
+    if (render_data->scissor_empty) {
+        return pb;
+    }
+    return push_scissor(pb, rect.x, rect.y, rect.w, rect.h);
+}
 
 static inline uint32_t npot2pot(uint32_t num)
 {
@@ -275,44 +328,7 @@ static void set_blend_mode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
     render_data->active_blend_mode = blendMode;
 }
 
-static SDL_Rect sanitize_scissor_rect(SDL_Renderer *renderer, const SDL_Rect *rect)
-{
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    SDL_Rect scissor_rect = {
-        .x = rect->x,
-        .y = rect->y,
-        .w = rect->w,
-        .h = rect->h
-    };
 
-    scissor_rect.w = SDL_max(scissor_rect.w, 0);
-    scissor_rect.h = SDL_max(scissor_rect.h, 0);
-
-    if (render_data->active_render_target) {
-        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, render_data->active_render_target->tex_width);
-        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, render_data->active_render_target->tex_height);
-        scissor_rect.w = SDL_min(scissor_rect.w, render_data->active_render_target->tex_width - scissor_rect.x);
-        scissor_rect.h = SDL_min(scissor_rect.h, render_data->active_render_target->tex_height - scissor_rect.y);
-    } else {
-        scissor_rect.x = SDL_clamp(scissor_rect.x, 0, (int)pb_back_buffer_width());
-        scissor_rect.y = SDL_clamp(scissor_rect.y, 0, (int)pb_back_buffer_height());
-        scissor_rect.w = SDL_min(scissor_rect.w, (int)pb_back_buffer_width() - scissor_rect.x);
-        scissor_rect.h = SDL_min(scissor_rect.h, (int)pb_back_buffer_height() - scissor_rect.y);
-    }
-
-    return scissor_rect;
-}
-
-static void set_surface_color_format(const int bpp)
-{
-    if (bpp == 16) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
-    } else if (bpp == 15) {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5, false);
-    } else {
-        pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
-    }
-}
 
 // clang-format off
 static inline void combiner_init(void)
@@ -626,59 +642,56 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
 
 static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    uint32_t pitch, zpitch, clip_width, clip_height, format, dma_channel;
-    xgu_texture_t *xgu_texture = (texture) ? (xgu_texture_t *)texture->internal : NULL;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_texture_t *xgu_texture = texture ? (xgu_texture_t *)texture->internal : NULL;
     extern unsigned int pb_ColorFmt; // From pbkit.c
 
-    if (xgu_texture == NULL) {
-        set_surface_color_format(XVideoGetMode().bpp);
+    if (render_data->active_render_target == xgu_texture) {
+        return true;
+    }
 
+    uint32_t pitch, clip_width, clip_height, dma_channel, color_offset;
+
+    if (xgu_texture == NULL) {
         dma_channel = DMA_CHANNEL_PIXEL_RENDERER;
+        color_offset = 0;
         pitch = pb_back_buffer_pitch();
         clip_width = pb_back_buffer_width();
         clip_height = pb_back_buffer_height();
-        format = XGU_MASK(NV097_SET_SURFACE_FORMAT_COLOR, pb_ColorFmt);
+        render_data->active_surface_format = pb_ColorFmt;
     } else {
-        int surface_format, bytes_per_pixel;
-        bool status = sdl_to_xgu_surface_format(texture->format, &surface_format, &bytes_per_pixel);
-
-        // All the checks during texture creation should ensure this never fails
+        int surface_format;
+        bool status = sdl_to_xgu_surface_format(texture->format, &surface_format, NULL);
         assert(status);
 
-        // Ensure idle before messing with DMA channels
-        p = pb_begin();
-        p = pb_push1(p, NV097_WAIT_FOR_IDLE, 0);
-        pb_end(p);
-
-        pb_set_dma_address(&render_data->render_target_dma_ctx, xgu_texture->data, xgu_texture->pitch * xgu_texture->data_height - 1);
-
-        // Ensures any surface fills are done with the appropriate colour format while rendering to this target
-        set_surface_color_format(bytes_per_pixel * 8);
-
         dma_channel = render_data->render_target_dma_ctx.ChannelID;
+        color_offset = (uint32_t)xgu_texture->data_physical_address;
         pitch = xgu_texture->pitch;
         clip_width = xgu_texture->tex_width;
         clip_height = xgu_texture->tex_height;
-        format = XGU_MASK(NV097_SET_SURFACE_FORMAT_COLOR, surface_format);
+        render_data->active_surface_format = (uint32_t)surface_format;
     }
 
-    format |= XGU_MASK(NV097_SET_SURFACE_FORMAT_ZETA, NV097_SET_SURFACE_FORMAT_ZETA_Z24S8) |
-              XGU_MASK(NV097_SET_SURFACE_FORMAT_TYPE, NV097_SET_SURFACE_FORMAT_TYPE_PITCH);
+    const uint32_t format = XGU_MASK(NV097_SET_SURFACE_FORMAT_COLOR, render_data->active_surface_format) |
+                            XGU_MASK(NV097_SET_SURFACE_FORMAT_ZETA, NV097_SET_SURFACE_FORMAT_ZETA_Z24S8) |
+                            XGU_MASK(NV097_SET_SURFACE_FORMAT_TYPE, NV097_SET_SURFACE_FORMAT_TYPE_PITCH);
+    const uint32_t zpitch = pb_back_buffer_width() * 4;
 
-    // We are not using the depth buffer so it is unchanged. Stick to the back buffer width.
-    // Z24S8 format has 4 bytes per pixel for the zeta buffer
-    zpitch = pb_back_buffer_width() * 4;
+    render_data->active_render_target = xgu_texture;
+    render_data->active_texture = NULL;
+    render_data->viewport = (SDL_Rect){ 0, 0, (int)clip_width, (int)clip_height };
+    render_data->clip_rect = render_data->viewport;
+    render_data->viewport_dirty = false;
+    render_data->clip_rect_enabled = false;
+    render_data->scissor_empty = false;
 
     p = pb_begin();
-
     p = pb_push1(p, NV097_WAIT_FOR_IDLE, 0);
     p = pb_push1(p, NV097_SET_CONTEXT_DMA_COLOR, dma_channel);
-
     p = pb_push1(p, NV097_SET_SURFACE_PITCH,
                  XGU_MASK(NV097_SET_SURFACE_PITCH_COLOR, pitch) |
                      XGU_MASK(NV097_SET_SURFACE_PITCH_ZETA, zpitch));
-    p = pb_push1(p, NV097_SET_SURFACE_COLOR_OFFSET, 0); // This is offset from the DMA address
+    p = pb_push1(p, NV097_SET_SURFACE_COLOR_OFFSET, color_offset);
     p = pb_push1(p, NV097_SET_SURFACE_CLIP_HORIZONTAL,
                  XGU_MASK(NV097_SET_SURFACE_CLIP_HORIZONTAL_WIDTH, clip_width) |
                      XGU_MASK(NV097_SET_SURFACE_CLIP_HORIZONTAL_X, 0));
@@ -686,10 +699,10 @@ static bool XBOX_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
                  XGU_MASK(NV097_SET_SURFACE_CLIP_VERTICAL_HEIGHT, clip_height) |
                      XGU_MASK(NV097_SET_SURFACE_CLIP_VERTICAL_Y, 0));
     p = pb_push1(p, NV097_SET_SURFACE_FORMAT, format);
-
+    p = xgu_set_viewport_offset(p, 0.0f, 0.0f, 0.0f, 0.0f);
+    p = push_scissor(p, 0, 0, (int)clip_width, (int)clip_height);
     pb_end(p);
 
-    render_data->active_render_target = xgu_texture;
     return true;
 }
 
@@ -808,64 +821,45 @@ static bool XBOX_QueueNoOp(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 
 static bool XBOX_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     const SDL_Rect *viewport = &cmd->data.viewport.rect;
 
-    // If the new viewport is the same as the current one, no need to update
-    if (SDL_memcmp(viewport, &render_data->viewport, sizeof(SDL_Rect)) == 0) {
+    if (!render_data->viewport_dirty &&
+        SDL_memcmp(viewport, &render_data->viewport, sizeof(SDL_Rect)) == 0) {
         return true;
     }
 
-    // Create a new rect that is the intersection of the new viewport and the current clip rect
-    // This is becaused SDL expects rendering to be clipped to the viewport and the clip rect
-    // but we can only set one scissor at a time.
-    SDL_Rect scissor_clipped_rect;
-    SDL_GetRectIntersection(&render_data->clip_rect, viewport, &scissor_clipped_rect);
-
-    scissor_clipped_rect = sanitize_scissor_rect(renderer, &scissor_clipped_rect);
+    render_data->viewport = *viewport;
+    render_data->viewport_dirty = false;
 
     p = pb_begin();
-    p = xgu_set_viewport_offset(p, viewport->x, viewport->y, 0.0f, 0.0f);
-    p = xgu_set_scissor_rect(p, false, scissor_clipped_rect.x, scissor_clipped_rect.y,
-                             scissor_clipped_rect.w, scissor_clipped_rect.h);
+    p = xgu_set_viewport_offset(p, (float)viewport->x, (float)viewport->y, 0.0f, 0.0f);
+    p = push_current_scissor(renderer, p);
     pb_end(p);
 
-    // Store the viewport in the render data
-    render_data->viewport = *viewport;
     return true;
 }
 
 static bool XBOX_RenderSetClipRect(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
-    SDL_Rect *clip_rect = &cmd->data.cliprect.rect;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    const bool enabled = cmd->data.cliprect.enabled;
+    const SDL_Rect *clip_rect = &cmd->data.cliprect.rect;
 
-    // If clipping is disabled, reset the clip rect to the entire back buffer
-    if (cmd->data.cliprect.enabled == false) {
-        const SDL_Rect no_clip = { 0, 0, pb_back_buffer_width(), pb_back_buffer_height() };
-        *clip_rect = no_clip;
-    }
-
-    // If the new clip rect is the same as the current one, no need to update
-    if (SDL_memcmp(clip_rect, &render_data->clip_rect, sizeof(SDL_Rect)) == 0) {
+    if (render_data->clip_rect_enabled == enabled &&
+        (!enabled || SDL_memcmp(clip_rect, &render_data->clip_rect, sizeof(SDL_Rect)) == 0)) {
         return true;
     }
 
-    // Create a new rect that is the intersection of the new clip rect and the current viewport
-    // This is because SDL expects rendering to be clipped to the viewport and the clip rect
-    // but we can only set one scissor at a time.
-    SDL_Rect scissor_clipped_rect;
-    SDL_GetRectIntersection(&render_data->viewport, clip_rect, &scissor_clipped_rect);
-
-    scissor_clipped_rect = sanitize_scissor_rect(renderer, &scissor_clipped_rect);
+    render_data->clip_rect_enabled = enabled;
+    if (enabled) {
+        render_data->clip_rect = *clip_rect;
+    }
 
     p = pb_begin();
-    p = xgu_set_scissor_rect(p, false, scissor_clipped_rect.x, scissor_clipped_rect.y,
-                             scissor_clipped_rect.w, scissor_clipped_rect.h);
+    p = push_current_scissor(renderer, p);
     pb_end(p);
 
-    // Store the clip rect in the render data
-    render_data->clip_rect = *clip_rect;
     return true;
 }
 
@@ -882,20 +876,34 @@ static bool XBOX_RenderSetDrawColor(SDL_Renderer *renderer, SDL_RenderCommand *c
 
 static bool XBOX_RenderClear(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
-    SDL_XGU_MAYBE_UNUSED xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
+    xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
     const SDL_FColor color = cmd->data.color.color;
 
-    const uint32_t color32 = ((uint32_t)(color.r * 255.0f) << 16) |
-                             ((uint32_t)(color.g * 255.0f) << 8) |
-                             ((uint32_t)(color.b * 255.0f) << 0) |
-                             ((uint32_t)(color.a * 255.0f) << 24);
+    const uint32_t r = (uint32_t)(int)(SDL_clamp(color.r * 255.0f, 0.0f, 255.0f) + 0.5f);
+    const uint32_t g = (uint32_t)(int)(SDL_clamp(color.g * 255.0f, 0.0f, 255.0f) + 0.5f);
+    const uint32_t b = (uint32_t)(int)(SDL_clamp(color.b * 255.0f, 0.0f, 255.0f) + 0.5f);
+    const uint32_t a = (uint32_t)(int)(SDL_clamp(color.a * 255.0f, 0.0f, 255.0f) + 0.5f);
 
-    if (render_data->active_render_target) {
-        pb_fill(0, 0, render_data->active_render_target->tex_width,
-                render_data->active_render_target->tex_height, color32);
+    uint32_t clear_color;
+    if (render_data->active_surface_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5) {
+        clear_color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    } else if (render_data->active_surface_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5) {
+        clear_color = ((a >> 7) << 15) | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
     } else {
-        pb_fill(0, 0, pb_back_buffer_width(), pb_back_buffer_height(), color32);
+        clear_color = (a << 24) | (r << 16) | (g << 8) | b;
     }
+
+    int target_w, target_h;
+    get_active_target_size(render_data, &target_w, &target_h);
+
+    p = pb_begin();
+    p = push_scissor(p, 0, 0, target_w, target_h);
+    p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, ((target_w - 1) << 16));
+    p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, ((target_h - 1) << 16));
+    p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, clear_color);
+    p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+    p = push_current_scissor(renderer, p);
+    pb_end(p);
 
     return true;
 }
@@ -1204,7 +1212,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
 
     // Change the framebuffer surface format based on the video mode
     const VIDEO_MODE vm = XVideoGetMode();
-    set_surface_color_format(vm.bpp);
+    pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, false);
 
     while (pb_init() < 0) {
         DbgPrint("[nxdk renderer] pbkit initialization failed, retrying...\n");
@@ -1264,7 +1272,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     p = xgu_set_composite_matrix(p, m_identity);
     p = xgu_set_viewport_offset(p, 0.0f, 0.0f, 0.0f, 0.0f);
     p = xgu_set_viewport_scale(p, 1.0f, 1.0f, 1.0f, 1.0f);
-    p = xgu_set_scissor_rect(p, false, 0, 0, pb_back_buffer_width(), pb_back_buffer_height());
+    p = push_scissor(p, 0, 0, (int)pb_back_buffer_width(), (int)pb_back_buffer_height());
     pb_end(p);
 
     const int SDL_XGU_RENDER_TARGET_DMA_CHANNEL = 3;
@@ -1314,7 +1322,7 @@ static bool XBOX_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_BGRA8888);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB4444);
-    SDL_SetNumberProperty(SDL_GetRendererProperties(renderer), SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 1024 * 1024);
+    SDL_SetNumberProperty(SDL_GetRendererProperties(renderer), SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 4096);
 
     // This hint makes SDL use the driver line API.
     SDL_SetHint(SDL_HINT_RENDER_LINE_METHOD, "2");
