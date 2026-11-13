@@ -1210,6 +1210,9 @@ static SDL_Surface *XBOX_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect
     return surface;
 }
 
+// The most vertical blanks RenderPresent waits for a buffer flip (see there).
+#define SDL_XGU_MAX_FLIP_WAIT 3
+
 static bool XBOX_RenderPresent(SDL_Renderer *renderer)
 {
     xgu_render_data_t *render_data = (xgu_render_data_t *)renderer->internal;
@@ -1222,12 +1225,14 @@ static bool XBOX_RenderPresent(SDL_Renderer *renderer)
     calculate_fps(FPS_STAGE_DISPLAY);
 #endif
 
-    // Wait while all 3 pbkit back buffers are queued, and ensure scanout of the new back buffer has finished
-    while (pb_finished()) {
+    // Wait while all 3 pbkit back buffers are queued, and ensure scanout of the new back buffer has finished.
+    // Both waits are capped: on hardware the flip always comes within a frame or two, but xemu can stall a flip
+    // for good, and an unbounded wait then hangs the title while its audio thread plays on.
+    for (int i = 0; i < SDL_XGU_MAX_FLIP_WAIT && pb_finished(); i++) {
         pb_wait_for_vbl();
     }
     const uint32_t back_buffer = (uint32_t)pb_back_buffer() & 0x03FFFFFF;
-    while ((VIDEOREG(SDL_XGU_PCRTC_START) & 0x03FFFFFF) == back_buffer) {
+    for (int i = 0; i < SDL_XGU_MAX_FLIP_WAIT && (VIDEOREG(SDL_XGU_PCRTC_START) & 0x03FFFFFF) == back_buffer; i++) {
         pb_wait_for_vbl();
     }
 
