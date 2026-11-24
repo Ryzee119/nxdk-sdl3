@@ -45,6 +45,9 @@ static void xbox_audio_callback(void *pac97device, void *data)
 // AC97 PCM-out bus master registers: current and last valid descriptor index.
 #define AC97_PO_CIV (*(volatile unsigned char *)0xFEC00114)
 #define AC97_PO_LVI (*(volatile unsigned char *)0xFEC00115)
+// S/PDIF out bus master: it spools the same buffers as PCM out, at its own pace.
+#define AC97_SP_CIV (*(volatile unsigned char *)0xFEC00174)
+#define AC97_SP_LVI (*(volatile unsigned char *)0xFEC00175)
 
 static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
 {
@@ -58,7 +61,12 @@ static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
     // most REFILL_DEPTH buffers are queued; the buffer handed out next then
     // finished at least two buffers ago (see SDL_XBOXAUDIO_REFILL_DEPTH).
     for (;;) {
-        int queued = (AC97_PO_LVI - AC97_PO_CIV) & 31;
+        // A buffer is only free once BOTH engines are done with it. S/PDIF
+        // can run behind PCM out; refilling on PCM out alone overwrote a
+        // buffer S/PDIF was still reading (static on digital/HDMI audio).
+        int queued_po = (AC97_PO_LVI - AC97_PO_CIV) & 31;
+        int queued_sp = (AC97_SP_LVI - AC97_SP_CIV) & 31;
+        int queued = queued_po > queued_sp ? queued_po : queued_sp;
         if (queued > SDL_XBOXAUDIO_REFILL_DEPTH + 1) {
             // More in flight than we ever queue: on an underrun the MCPX does
             // not halt at LVI, it laps stale descriptors (heard as a stuck
