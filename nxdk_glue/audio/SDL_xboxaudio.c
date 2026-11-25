@@ -67,7 +67,7 @@ static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
         int queued_po = (AC97_PO_LVI - AC97_PO_CIV) & 31;
         int queued_sp = (AC97_SP_LVI - AC97_SP_CIV) & 31;
         int queued = queued_po > queued_sp ? queued_po : queued_sp;
-        if (queued > SDL_XBOXAUDIO_REFILL_DEPTH + 1) {
+        if (queued > SDL_XBOXAUDIO_BUFFER_COUNT - 1) {
             // More in flight than we ever queue: on an underrun the MCPX does
             // not halt at LVI, it laps stale descriptors (heard as a stuck
             // loop, or silence). Reset the engine and start over, with
