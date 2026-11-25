@@ -10,8 +10,14 @@
 #include <assert.h>
 #include <xboxkrnl/xboxkrnl.h>
 
+// Two buffers are queued on the hardware at a time (playsem starts at 1), and
+// the buffer filled next is the oldest one. With three, that is the buffer the
+// controller has only just moved off: the controller moves CIV on before the
+// last samples of a buffer have been played (seen on 1.6 consoles), so its end
+// was overwritten with later sound, heard as static. With four, the buffer
+// filled finished two buffers earlier. Latency is unchanged.
 #ifndef SDL_XBOXAUDIO_BUFFER_COUNT
-#define SDL_XBOXAUDIO_BUFFER_COUNT 3
+#define SDL_XBOXAUDIO_BUFFER_COUNT 4
 #endif
 
 #if (SDL_XBOXAUDIO_BUFFER_COUNT < 2)
