@@ -11,11 +11,18 @@
 #include <xboxkrnl/xboxkrnl.h>
 
 #ifndef SDL_XBOXAUDIO_BUFFER_COUNT
-#define SDL_XBOXAUDIO_BUFFER_COUNT 3
+#define SDL_XBOXAUDIO_BUFFER_COUNT 4
 #endif
 
-#if (SDL_XBOXAUDIO_BUFFER_COUNT < 2)
-#error "SDL_XBOXAUDIO_BUFFER_COUNT must be at least 2"
+// Buffers queued on the hardware (LVI - CIV) at which WaitDevice hands out the
+// next one. Kept at BUFFER_COUNT - 3 so the buffer refilled is never the one
+// the hardware finished last: the controller moves CIV on before the last
+// samples of a buffer have been played (seen on 1.6 consoles), and refilling
+// that buffer put the start of later sound into the end of it, heard as static.
+#define SDL_XBOXAUDIO_REFILL_DEPTH (SDL_XBOXAUDIO_BUFFER_COUNT - 3)
+
+#if (SDL_XBOXAUDIO_BUFFER_COUNT < 4)
+#error "SDL_XBOXAUDIO_BUFFER_COUNT must be at least 4"
 #endif
 
 typedef struct SDL_PrivateAudioData
@@ -47,12 +54,12 @@ static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
 
     // Refill from the hardware queue depth, not from semaphore posts: a DPC
     // that is already queued is not queued again, so completions can merge
-    // into one post, and a lost post must not stall playback. Refill while
-    // fewer than BUFFER_COUNT-1 buffers are queued; the buffer handed out next
-    // (finished BUFFER_COUNT-1 slots ago) is then free.
+    // into one post, and a lost post must not stall playback. Refill once at
+    // most REFILL_DEPTH buffers are queued; the buffer handed out next then
+    // finished at least two buffers ago (see SDL_XBOXAUDIO_REFILL_DEPTH).
     for (;;) {
         int queued = (AC97_PO_LVI - AC97_PO_CIV) & 31;
-        if (queued > SDL_XBOXAUDIO_BUFFER_COUNT - 1) {
+        if (queued > SDL_XBOXAUDIO_REFILL_DEPTH + 1) {
             // More in flight than we ever queue: on an underrun the MCPX does
             // not halt at LVI, it laps stale descriptors (heard as a stuck
             // loop, or silence). Reset the engine and start over, with
@@ -64,7 +71,7 @@ static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
             // Without XAudioResync (stock nxdk), keep refilling: LVI catches up.
             break;
         }
-        if (queued <= SDL_XBOXAUDIO_BUFFER_COUNT - 2) {
+        if (queued <= SDL_XBOXAUDIO_REFILL_DEPTH) {
             break;
         }
         KeWaitForSingleObject(&audio_data->playsem, Executive, KernelMode, FALSE, &timeout);
